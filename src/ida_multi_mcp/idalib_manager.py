@@ -243,6 +243,8 @@ class IdalibManager:
         """
         if proc.poll() is not None:
             return
+
+        # Step 1: graceful request (CTRL_BREAK on Windows, SIGTERM on POSIX).
         try:
             if sys.platform == "win32":
                 import signal as _signal
@@ -256,15 +258,20 @@ class IdalibManager:
         except Exception:
             pass
 
-        # Graceful path didn't complete — force terminate, then hard kill.
-        try:
-            proc.terminate()
-            proc.wait(timeout=5)
-            return
-        except subprocess.TimeoutExpired:
-            pass
-        except Exception:
-            pass
+        # Step 2 (Windows only): TerminateProcess, since CTRL_BREAK may be
+        # ignored. On POSIX the graceful step already sent SIGTERM, so go
+        # straight to the hard kill below instead of repeating terminate().
+        if sys.platform == "win32":
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+                return
+            except subprocess.TimeoutExpired:
+                pass
+            except Exception:
+                pass
+
+        # Step 3: hard kill.
         try:
             proc.kill()
         except Exception:
