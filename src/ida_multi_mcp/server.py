@@ -37,6 +37,56 @@ def _load_static_ida_tools() -> list[dict]:
     return _STATIC_IDA_TOOLS
 
 
+def _json_text(value: Any) -> str:
+    return json.dumps(value, separators=(",", ":"))
+
+
+def _schema_preserving_preview(value: Any, max_chars: int) -> Any:
+    """Return a smaller value of the same JSON type (str/list/dict) when huge."""
+    if max_chars <= 0:
+        return value
+    try:
+        if len(_json_text(value)) <= max_chars:
+            return value
+    except Exception:
+        return value
+
+    if isinstance(value, str):
+        return value[:max_chars]
+
+    if isinstance(value, list):
+        # Accumulate serialized length per item instead of re-serializing
+        # the whole prefix each iteration (which is quadratic).
+        out: list[Any] = []
+        used = 2  # "[" and "]"
+        for item in value:
+            try:
+                item_len = len(_json_text(item))
+            except Exception:
+                break
+            used += item_len + (1 if out else 0)  # +1 for comma separator
+            if used > max_chars:
+                break
+            out.append(item)
+        return out
+
+    if isinstance(value, dict):
+        def _truncate(v: Any, depth: int = 0) -> Any:
+            if depth > 6:
+                return v
+            if isinstance(v, str) and len(v) > 1000:
+                return v[:1000] + f"... [{len(v)} chars total]"
+            if isinstance(v, list):
+                return [_truncate(x, depth + 1) for x in v[:50]]
+            if isinstance(v, dict):
+                return {k: _truncate(x, depth + 1) for k, x in v.items()}
+            return v
+
+        return _truncate(value)
+
+    return value
+
+
 class IdaMultiMcpServer:
     """MCP server that aggregates multiple IDA Pro instances.
 
@@ -108,50 +158,6 @@ class IdaMultiMcpServer:
                 return structured.get("result")
 
             return structured
-
-        def _json_text(value: Any) -> str:
-            return json.dumps(value, separators=(",", ":"))
-
-        def _schema_preserving_preview(value: Any, max_chars: int) -> Any:
-            """Return a smaller value of the same JSON type (str/list/dict) when huge."""
-            if max_chars <= 0:
-                return value
-            try:
-                if len(_json_text(value)) <= max_chars:
-                    return value
-            except Exception:
-                return value
-
-            if isinstance(value, str):
-                return value[:max_chars]
-
-            if isinstance(value, list):
-                out: list[Any] = []
-                for item in value:
-                    out.append(item)
-                    try:
-                        if len(_json_text(out)) > max_chars:
-                            out.pop()
-                            break
-                    except Exception:
-                        break
-                return out
-
-            if isinstance(value, dict):
-                def _truncate(v: Any, depth: int = 0) -> Any:
-                    if depth > 6:
-                        return v
-                    if isinstance(v, str) and len(v) > 1000:
-                        return v[:1000] + f"... [{len(v)} chars total]"
-                    if isinstance(v, list):
-                        return [_truncate(x, depth + 1) for x in v[:50]]
-                    if isinstance(v, dict):
-                        return {k: _truncate(x, depth + 1) for k, x in v.items()}
-                    return v
-
-                return _truncate(value)
-
-            return value
 
         # Override tools/list to return cached tools
 
