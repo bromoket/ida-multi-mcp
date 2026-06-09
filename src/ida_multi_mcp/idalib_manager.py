@@ -146,9 +146,12 @@ class IdalibManager:
             creation_flags = subprocess.CREATE_NO_WINDOW
 
         try:
+            # stdout is discarded: the worker logs via stderr, and leaving an
+            # undrained PIPE deadlocks the worker once IDA's analysis output
+            # fills the OS pipe buffer (~64KB) during _wait_for_ready.
             proc = subprocess.Popen(
                 cmd,
-                stdout=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 creationflags=creation_flags,
             )
