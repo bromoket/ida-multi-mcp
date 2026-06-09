@@ -113,10 +113,23 @@ class TestBssSafeReads:
         load_map = {0x1000: True, 0x1001: False, 0x1002: True, 0x1003: False}
         value_map = {0x1000: 0x41, 0x1002: 0x43}
 
+        # Region has a BSS gap → bulk get_bytes returns None → slow path.
+        utils.ida_bytes.get_bytes.return_value = None
         utils.ida_bytes.is_loaded.side_effect = lambda ea: load_map.get(ea, False)
         utils.ida_bytes.get_byte.side_effect = lambda ea: value_map[ea]
 
         assert read_bytes_bss_safe(0x1000, 4) == b"A\x00C\x00"
+
+    def test_read_bytes_bss_safe_fast_path_when_loaded(self):
+        # Whole range loaded → single get_bytes call, no per-byte loop.
+        utils.ida_bytes.get_bytes.side_effect = None
+        utils.ida_bytes.get_bytes.return_value = b"ABCD"
+        utils.ida_bytes.get_byte.side_effect = AssertionError("slow path used")
+
+        assert read_bytes_bss_safe(0x1000, 4) == b"ABCD"
+
+    def test_read_bytes_bss_safe_zero_size(self):
+        assert read_bytes_bss_safe(0x1000, 0) == b""
 
     def test_read_int_bss_safe_returns_zero_for_unloaded_start(self):
         utils.ida_bytes.is_loaded.side_effect = lambda ea: False

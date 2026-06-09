@@ -468,6 +468,14 @@ def parse_address(addr: str | int) -> int:
 
 def read_bytes_bss_safe(ea: int, size: int) -> bytes:
     """Read bytes from the IDB, substituting zeros for unloaded BSS bytes."""
+    if size <= 0:
+        return b""
+    # Fast path: one bulk read when the whole range is loaded. get_bytes
+    # returns None if any byte is missing, so we only fall back to the slow
+    # per-byte loop for regions that actually straddle a BSS gap.
+    data = ida_bytes.get_bytes(ea, size)
+    if data is not None and len(data) == size:
+        return bytes(data)
     out = bytearray(size)
     for offset in range(size):
         current_ea = ea + offset
