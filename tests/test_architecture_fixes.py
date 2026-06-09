@@ -95,6 +95,8 @@ class TestArchitectureFixes(unittest.TestCase):
                     "output_dir": out_dir,
                     "mode": "single",
                     "instance_id": "abcd",
+                    # Temp dir is outside cwd; opt in to writing there.
+                    "allow_outside_cwd": True,
                 }
             )
 
