@@ -24,6 +24,9 @@ _strings_cache: list[tuple[int, str]] | None = None
 # Cached function list: [Function(...), ...]
 _funcs_cache: list["Function"] | None = None
 
+# Cached function query metadata: [{addr, name, size, size_int, has_type}, ...]
+_funcs_query_cache: list[dict] | None = None
+
 # Cached globals list: [Global(...), ...]
 _globals_cache: list["Global"] | None = None
 
@@ -50,10 +53,36 @@ def _get_funcs_cache() -> list["Function"]:
     return _funcs_cache
 
 
+def _get_funcs_query_cache() -> list[dict]:
+    """Cached function metadata for func_query (adds size_int + has_type).
+
+    Kept separate from _funcs_cache because it carries extra fields used
+    only for filtering/sorting. Invalidated together with _funcs_cache.
+    """
+    global _funcs_query_cache
+    if _funcs_query_cache is None:
+        rows: list[dict] = []
+        tif = ida_typeinf.tinfo_t()
+        for addr in idautils.Functions():
+            fn = idaapi.get_func(addr)
+            if not fn:
+                continue
+            size_int = fn.end_ea - fn.start_ea
+            fn_name = ida_funcs.get_func_name(fn.start_ea) or "<unnamed>"
+            has_type = bool(ida_nalt.get_tinfo(tif, fn.start_ea))
+            rows.append({
+                "addr": hex(fn.start_ea), "name": fn_name,
+                "size": hex(size_int), "size_int": size_int, "has_type": has_type,
+            })
+        _funcs_query_cache = rows
+    return _funcs_query_cache
+
+
 def invalidate_funcs_cache():
-    """Clear the function cache (call after function changes)."""
-    global _funcs_cache
+    """Clear the function caches (call after function changes)."""
+    global _funcs_cache, _funcs_query_cache
     _funcs_cache = None
+    _funcs_query_cache = None
 
 
 def _get_globals_cache() -> list["Global"]:
@@ -516,18 +545,8 @@ def func_query(
     Example: {name_regex: 'crypt', min_size: 100, sort_by: 'size', descending: true}"""
     queries = normalize_dict_list(queries)
 
-    all_functions: list[dict] = []
-    for addr in idautils.Functions():
-        fn = idaapi.get_func(addr)
-        if not fn:
-            continue
-        size_int = fn.end_ea - fn.start_ea
-        fn_name = ida_funcs.get_func_name(fn.start_ea) or "<unnamed>"
-        has_type = bool(ida_nalt.get_tinfo(ida_typeinf.tinfo_t(), fn.start_ea))
-        all_functions.append({
-            "addr": hex(fn.start_ea), "name": fn_name,
-            "size": hex(size_int), "size_int": size_int, "has_type": has_type,
-        })
+    # Shared, cached metadata — must not be mutated in place below.
+    all_functions = _get_funcs_query_cache()
 
     results = []
     for query in queries:
@@ -560,6 +579,10 @@ def func_query(
 
         if "has_type" in query:
             filtered = [f for f in filtered if f["has_type"] is bool(query["has_type"])]
+
+        # Copy before sorting in place when no filter narrowed the shared cache.
+        if filtered is all_functions:
+            filtered = list(filtered)
 
         if sort_by == "name":
             filtered.sort(key=lambda f: f["name"].lower(), reverse=descending)

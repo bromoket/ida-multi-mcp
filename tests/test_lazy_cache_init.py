@@ -173,6 +173,43 @@ class TestApiCoreLazyCaches:
 
         assert getattr(api_core.refresh_caches, "__ida_mcp_timeout_sec__", None) == 120.0
 
+    def test_func_query_builds_cache_once(self, ida_mcp_modules):
+        api_core, _ = ida_mcp_modules
+        api_core._funcs_query_cache = None
+        api_core.idautils.Functions.return_value = [0x1000, 0x2000]
+        api_core.idaapi.get_func.side_effect = lambda ea: SimpleNamespace(start_ea=ea, end_ea=ea + 0x40)
+        api_core.ida_funcs.get_func_name.side_effect = lambda ea: f"sub_{ea:x}"
+        api_core.ida_nalt.get_tinfo.return_value = False
+
+        first = api_core.func_query({"offset": 0, "count": 50})
+        second = api_core.func_query({"offset": 0, "count": 50})
+
+        # Functions() iterated once; second call served from the query cache.
+        assert api_core.idautils.Functions.call_count == 1
+        assert first == second
+        assert first[0]["data"][0]["addr"] == "0x1000"
+        # size_int is stripped from output.
+        assert "size_int" not in first[0]["data"][0]
+
+    def test_func_query_cache_invalidated_with_funcs_cache(self, ida_mcp_modules):
+        api_core, _ = ida_mcp_modules
+        api_core._funcs_query_cache = [{"addr": "0xdead", "name": "x",
+                                        "size": "0x1", "size_int": 1, "has_type": False}]
+        api_core.invalidate_funcs_cache()
+        assert api_core._funcs_query_cache is None
+
+    def test_func_query_sort_does_not_mutate_cache(self, ida_mcp_modules):
+        api_core, _ = ida_mcp_modules
+        api_core._funcs_query_cache = None
+        api_core.idautils.Functions.return_value = [0x2000, 0x1000]
+        api_core.idaapi.get_func.side_effect = lambda ea: SimpleNamespace(start_ea=ea, end_ea=ea + 0x40)
+        api_core.ida_funcs.get_func_name.side_effect = lambda ea: f"sub_{ea:x}"
+        api_core.ida_nalt.get_tinfo.return_value = False
+
+        api_core.func_query({"sort_by": "addr"})
+        # Cache must remain in original Functions() order, not sorted order.
+        assert [r["addr"] for r in api_core._funcs_query_cache] == ["0x2000", "0x1000"]
+
 
 class TestApiModifyCacheInvalidation:
     def test_rename_invalidates_relevant_caches(self, ida_mcp_modules):

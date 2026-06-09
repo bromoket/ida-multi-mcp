@@ -1518,8 +1518,12 @@ def classify_functions(
         count = 5000
 
     if isinstance(addrs, str) and addrs.strip() == "*":
-        func_eas = [ea for ea in idautils.Functions()
-                    if not (idaapi.get_func(ea) and idaapi.get_func(ea).flags & idaapi.FUNC_LIB)]
+        func_eas = []
+        for ea in idautils.Functions():
+            func = idaapi.get_func(ea)
+            if func and func.flags & idaapi.FUNC_LIB:
+                continue
+            func_eas.append(ea)
     else:
         addrs_list = normalize_list_input(addrs)
         func_eas = [parse_address(a) for a in addrs_list]
@@ -1589,14 +1593,18 @@ def func_profile(
                 edge_count += 1
         complexity = edge_count - bb_count + 2
 
-        xref_count = sum(1 for _ in idautils.XrefsTo(ea, 0))
+        # Single pass over XrefsTo: total xrefs and call-type (caller) xrefs.
+        xref_count = 0
+        caller_count = 0
+        for x in idautils.XrefsTo(ea, 0):
+            xref_count += 1
+            if x.type in (idaapi.fl_CF, idaapi.fl_CN):
+                caller_count += 1
         callee_count = 0
         for item_ea in idautils.FuncItems(ea):
             for xref in idautils.XrefsFrom(item_ea, 0):
                 if xref.type in (idaapi.fl_CF, idaapi.fl_CN):
                     callee_count += 1
-        caller_count = sum(1 for x in idautils.XrefsTo(ea, 0)
-                          if x.type in (idaapi.fl_CF, idaapi.fl_CN))
 
         string_count = len(extract_function_strings(ea))
 
