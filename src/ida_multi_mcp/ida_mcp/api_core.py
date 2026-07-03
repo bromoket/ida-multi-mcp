@@ -7,6 +7,7 @@ from typing import Annotated, Optional
 import ida_auto
 import ida_funcs
 import ida_hexrays
+import ida_kernwin
 import ida_loader
 import idaapi
 import idautils
@@ -608,7 +609,16 @@ def idb_save(
     path: Annotated[str, "Optional destination path (default: current IDB path)"] = "",
 ) -> dict:
     """Save active IDB to disk. Call after renaming, retyping, or commenting
-    to persist changes. Optionally specify a custom output path."""
+    to persist changes. Optionally specify a custom output path.
+
+    GUI-safe (upstream fix, issue #446): in the GUI the open database is backed
+    by loose working files (.id0/.id1/.id2/.nam/.til) that IDA actively manages;
+    packing+killing them out from under the running GUI corrupts the database on
+    the next reopen. So in GUI mode this uses IDA's native in-place save
+    (save_database(None, 0), equivalent to Ctrl+W), and for an explicit different
+    destination writes a compressed copy WITHOUT killing the live working files.
+    Only headless idalib -- which has no live loose files to clobber -- packs
+    into a single compressed .i64/.idb."""
     try:
         save_path = path.strip() if path else ""
         if not save_path:
@@ -616,7 +626,26 @@ def idb_save(
         if not save_path:
             return {"ok": False, "path": None, "error": "Could not resolve IDB path"}
 
-        ok = bool(ida_loader.save_database(save_path, 0))
+        try:
+            is_gui = bool(ida_kernwin.is_idaq())
+        except Exception:
+            is_gui = False
+
+        if is_gui:
+            # GUI: never DBFL_KILL the loose files of the open database.
+            current = ida_loader.get_path(ida_loader.PATH_TYPE_IDB)
+            if path and save_path != current:
+                # Save-as a compressed snapshot to a new path; leaves the live
+                # working files intact.
+                ok = bool(ida_loader.save_database(save_path, ida_loader.DBFL_COMP))
+            else:
+                # Native in-place save (Ctrl+W).
+                ok = bool(ida_loader.save_database(None, 0))
+        else:
+            # Headless idalib: safe to pack into a single compressed file.
+            flags = ida_loader.DBFL_KILL | ida_loader.DBFL_COMP
+            ok = bool(ida_loader.save_database(save_path, flags))
+
         result: dict = {"ok": ok, "path": save_path}
         if not ok:
             result["error"] = "save_database returned false"
