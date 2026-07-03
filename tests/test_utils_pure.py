@@ -33,7 +33,7 @@ _SUBMODULES = [
     "rpc", "http", "framework",
     "api_core", "api_analysis", "api_memory", "api_types",
     "api_modify", "api_stack", "api_debug", "api_python", "api_resources",
-    "api_survey", "api_composite", "compat",
+    "api_survey", "api_composite", "api_sigmaker", "compat",
 ]
 
 # Create a real sync stub with IDAError
@@ -45,6 +45,7 @@ _sync_stub.IDAError = IDAError
 _sync_stub.IDASyncError = type("IDASyncError", (Exception,), {})
 _sync_stub.CancelledError = type("CancelledError", (Exception,), {})
 _sync_stub.idasync = lambda f: f  # no-op decorator
+_sync_stub.tool_timeout = lambda *a, **k: (lambda f: f)  # no-op decorator factory
 _sync_stub.ida_major = 9
 sys.modules[f"{_PKG}.sync"] = _sync_stub
 
