@@ -41,6 +41,15 @@ class TestInfo:
 TESTS: dict[str, TestInfo] = {}
 
 
+class SkipTest(Exception):
+    """Raised by tests to indicate a runtime skip condition."""
+
+
+def skip_test(reason: str = "") -> None:
+    """Skip the current test at runtime."""
+    raise SkipTest(reason or "skipped")
+
+
 def test(*, binary: str = "", skip: bool = False) -> Callable:
     """Decorator to register a test function.
 
@@ -177,6 +186,37 @@ def assert_all_have_keys(items: list[dict], *keys: str) -> None:
         assert isinstance(item, dict), f"Item {i} is not a dict: {type(item).__name__}"
         missing = [k for k in keys if k not in item]
         assert not missing, f"Item {i} missing keys: {missing}"
+
+
+def assert_ok(result: dict, *required_keys: str) -> None:
+    """Assert a result dict represents success and contains required keys."""
+    assert isinstance(result, dict), f"Expected dict, got {type(result).__name__}"
+    error = result.get("error")
+    assert error in (None, ""), f"Expected success, got error: {error!r}"
+    for key in required_keys:
+        assert key in result, f"Missing key: {key}"
+        assert result[key] is not None, f"Expected non-None value for key: {key}"
+
+
+def assert_error(result: dict, *, contains: str | None = None) -> None:
+    """Assert a result dict represents an error."""
+    assert isinstance(result, dict), f"Expected dict, got {type(result).__name__}"
+    error = result.get("error")
+    assert isinstance(error, str) and error, f"Expected non-empty error, got {error!r}"
+    if contains is not None:
+        assert contains in error, f"Expected {contains!r} in error {error!r}"
+
+
+@dataclass(frozen=True)
+class OptionalShape:
+    """Marker: a key/value may be missing or None, else it matches ``schema``."""
+
+    schema: Any
+
+
+def optional(schema: Any) -> OptionalShape:
+    """Allow a key/value to be missing or None, otherwise validate against schema."""
+    return OptionalShape(schema)
 
 
 # ============================================================================
@@ -520,6 +560,18 @@ def _run_single_test(name: str, info: TestInfo, verbose: bool) -> TestResult:
             name=name,
             category=info.module,
             status="passed",
+            duration=duration,
+        )
+
+    except SkipTest as e:
+        duration = time.time() - start_time
+        reason = str(e) or "skipped"
+        if verbose:
+            print(f"  - {name} (skipped: {reason})")
+        return TestResult(
+            name=name,
+            category=info.module,
+            status="skipped",
             duration=duration,
         )
 
