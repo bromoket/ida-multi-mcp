@@ -1,0 +1,19 @@
+{
+  "va2name": {
+    "0x1400014b0": "alloc_zero",
+    "0x1400014f0": "alloc_zero_r",
+    "0x140001680": "fnv_loop",
+    "0x1400016c0": "fnv_unrolled",
+    "0x140002ea0": "main",
+    "0x140001450": "mix_o0",
+    "0x140001760": "mix_o2",
+    "0x140001540": "parse_ipv4_a",
+    "0x1400015b0": "parse_ipv4_b",
+    "0x140001620": "parse_ipv4_c",
+    "0x140001790": "sum_array",
+    "0x1400017f0": "sum_array_ptr",
+    "0x1400017c0": "sum_array_while",
+    "0x140001850": "vm_exec",
+    "0x140001810": "xor_array"
+  }
+}
