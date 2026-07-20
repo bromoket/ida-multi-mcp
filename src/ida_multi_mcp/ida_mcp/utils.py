@@ -239,6 +239,44 @@ class TypeEdit(TypedDict, total=False):
     variable: Annotated[str, "Local variable name (for kind=local)"]
 
 
+class StructFieldUpsert(TypedDict, total=False):
+    """Single struct member replace/insert operation.
+
+    Targets the member currently covering `offset` -- a gap, a `gapNN`
+    placeholder, or a named field -- and replaces it in place. Existing members
+    never shift, because struct members are offset-addressed.
+
+    Provide exactly one of `size` or `type`.
+    """
+
+    offset: Annotated[str | int, "Byte offset of the member within the struct (hex or int)"]
+    name: Annotated[str, "New member name"]
+    old_type: NotRequired[
+        Annotated[
+            str,
+            "Type or member name that must currently cover the offset. Required "
+            "when the target is a named member (guards against clobbering work); "
+            "optional when the target is a gap.",
+        ]
+    ]
+    size: NotRequired[
+        Annotated[int, "Integer member size: 1/2/4/8 -> uint8/16/32/64 (use size OR type)"]
+    ]
+    type: NotRequired[
+        Annotated[str, "C type name or declaration for the new member (use size OR type)"]
+    ]
+
+
+class StructMemberUpsert(TypedDict, total=False):
+    """Upsert struct members by offset without shifting existing fields."""
+
+    struct: Annotated[str, "Struct type name"]
+    members: Annotated[list[StructFieldUpsert] | StructFieldUpsert, "Members to upsert"]
+    dry_run: NotRequired[
+        Annotated[bool, "Validate only (check offsets/old_type/new type); no changes"]
+    ]
+
+
 class StackVarDecl(TypedDict):
     """Stack variable declaration"""
 

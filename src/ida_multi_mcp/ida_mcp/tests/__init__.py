@@ -18,5 +18,6 @@ from ..framework import run_tests
 
 # Import test modules so their @test-decorated functions register on import.
 from . import test_api_sigmaker
+from . import test_api_types
 
-__all__ = ["run_tests", "test_api_sigmaker"]
+__all__ = ["run_tests", "test_api_sigmaker", "test_api_types"]
