@@ -280,3 +280,24 @@ class TestPaginate:
         page = paginate(data, offset=3, count=10)
         assert page["data"] == [3, 4]
         assert page["next_offset"] is None
+
+
+def test_pattern_filter_rejects_non_string_pattern():
+    """A JSON caller can pass an int/list here; fail clearly, not with TypeError.
+
+    Cf. mrexodia/ida-pro-mcp#353 -- without the guard, len()/startswith()
+    raise a bare TypeError that surfaces as an opaque internal error.
+    """
+    data = [{"name": "alpha"}, {"name": "beta"}]
+    for bad in (5, ["a"], {"k": "v"}, 1.5):
+        with pytest.raises(Exception) as exc:
+            pattern_filter(data, bad, "name")
+        assert "must be a string" in str(exc.value), f"bad input {bad!r}"
+
+
+def test_pattern_filter_still_accepts_normal_patterns():
+    """The guard must not disturb the falsy-passthrough or ordinary matching."""
+    data = [{"name": "alpha"}, {"name": "beta"}]
+    assert pattern_filter(data, "", "name") == data      # falsy -> passthrough
+    assert pattern_filter(data, None, "name") == data    # falsy -> passthrough
+    assert pattern_filter(data, "alpha", "name") == [{"name": "alpha"}]
