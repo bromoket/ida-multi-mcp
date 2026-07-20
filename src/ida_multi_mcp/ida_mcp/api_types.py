@@ -1,3 +1,4 @@
+import re
 from typing import Annotated, TypedDict
 
 import ida_typeinf
@@ -684,6 +685,44 @@ def _build_member_tinfo(field: dict) -> ida_typeinf.tinfo_t:
     return ida_typeinf.tinfo_t(_SIZE_TO_BTF[size])
 
 
+# IDA names synthetic gap members `gap<hex-offset>` (gap4, gap1C, ...). Match
+# that shape exactly, NOT a bare "gap" prefix: upstream used
+# cur_name.startswith("gap"), which silently reclassified real fields like
+# `gap_count` or `gapSize` as fillable gaps and dropped their old_type guard --
+# i.e. an unguarded clobber of named work. Confirmed live on IDA 9.4.
+_GAP_NAME_RE = re.compile(r"^gap[0-9A-Fa-f]+$")
+
+
+def _is_gap_like(udm) -> bool:
+    """True if this member is a real gap or an IDA-generated gapNN placeholder."""
+    return bool(udm.is_gap() or _GAP_NAME_RE.match(udm.name or ""))
+
+
+def _old_type_matches(old_type: str, udm) -> bool:
+    """Does `old_type` identify the member currently at this offset?
+
+    Compares the raw spellings first, then falls back to parsing `old_type` and
+    comparing resolved types. That fallback is what makes the tool replayable:
+    IDA normalizes spellings on storage (`int` -> `signed __int32`), so after a
+    successful upsert a literal re-run of the *same* command would otherwise
+    fail its own guard -- breaking retry/resume, which is exactly how an agent
+    drives this.
+    """
+    cur_type_str = udm.type._print()
+    if old_type in (udm.name, cur_type_str, str(udm.type)):
+        return True
+    try:
+        parsed = _parse_type_tinfo(old_type)
+    except Exception:
+        return False
+    if parsed._print() == cur_type_str:
+        return True
+    try:
+        return bool(parsed.equals_to(udm.type))
+    except Exception:
+        return False
+
+
 def _find_member_overlap(tif: ida_typeinf.tinfo_t, bit_off: int, bit_end: int):
     """First real (non-gap) member overlapping [bit_off, bit_end), else None."""
     udt = ida_typeinf.udt_type_data_t()
@@ -759,7 +798,7 @@ def _upsert_struct_member(
     cur_name = udm.name
     cur_type_str = udm.type._print()
     # gapNN placeholders (from the UI struct editor) are fillable like gaps.
-    gap_like = real_is_gap or cur_name.startswith("gap")
+    gap_like = _is_gap_like(udm)
     result["old"] = (
         f"gap {cur_name or '(anon)'} ({udm.size // 8} bytes) at {hex(m_begin // 8)}"
         if gap_like
@@ -786,7 +825,7 @@ def _upsert_struct_member(
                     f"(type {cur_type_str!r})"
                 ),
             }
-        if old_type not in (cur_name, cur_type_str, str(udm.type)):
+        if not _old_type_matches(old_type, udm):
             return {
                 **result,
                 "error": (
@@ -796,7 +835,7 @@ def _upsert_struct_member(
             }
     elif (
         old_type
-        and old_type not in (cur_name, cur_type_str, str(udm.type))
+        and not _old_type_matches(old_type, udm)
         and not old_type.lower().startswith("gap")
     ):
         return {
