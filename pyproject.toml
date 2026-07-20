@@ -18,6 +18,12 @@ dev = [
 idalib = [
     "idapro>=0.0.7",
 ]
+# Optional neural BCSD recall (jTrans embeddings). Model downloads on demand to
+# ~/.ida-mcp/models/; enable at runtime with IDA_MCP_SIM_NEURAL=1.
+neural = [
+    "torch>=2.0",
+    "transformers>=4.30",
+]
 
 [project.scripts]
 ida-multi-mcp = "ida_multi_mcp.__main__:main"
@@ -27,4 +33,4 @@ where = ["src"]
 include = ["ida_multi_mcp*"]
 
 [tool.setuptools.package-data]
-ida_multi_mcp = ["vendor/**/*", "ida_tool_schemas.json"]
+ida_multi_mcp = ["vendor/**/*", "ida_tool_schemas.json", "tools/jtrans_tokenizer/*"]

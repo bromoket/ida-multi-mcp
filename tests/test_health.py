@@ -38,13 +38,19 @@ class TestIsProcessAlive:
 
     @pytest.mark.skipif(sys.platform != "win32", reason="Windows-only test")
     def test_windows_alive(self):
-        """Test Windows path with a mocked ctypes kernel32."""
+        """Running process: handle opens and exit code is STILL_ACTIVE."""
         mock_kernel32 = MagicMock()
         mock_kernel32.OpenProcess.return_value = 1234  # non-zero = handle found
-        mock_kernel32.CloseHandle.return_value = None
+
+        def _set_still_active(handle, exit_code_ptr):
+            exit_code_ptr._obj.value = 259  # STILL_ACTIVE
+            return 1
+
+        mock_kernel32.GetExitCodeProcess.side_effect = _set_still_active
         with patch("ctypes.windll") as mock_windll:
             mock_windll.kernel32 = mock_kernel32
             assert is_process_alive(5678) is True
+        mock_kernel32.CloseHandle.assert_called_once()
 
     @pytest.mark.skipif(sys.platform != "win32", reason="Windows-only test")
     def test_windows_not_alive(self):
@@ -53,6 +59,22 @@ class TestIsProcessAlive:
         with patch("ctypes.windll") as mock_windll:
             mock_windll.kernel32 = mock_kernel32
             assert is_process_alive(5678) is False
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="Windows-only test")
+    def test_windows_zombie_reports_dead(self):
+        """Exited process whose handle is still open must report dead."""
+        mock_kernel32 = MagicMock()
+        mock_kernel32.OpenProcess.return_value = 1234  # handle still openable
+
+        def _set_exited(handle, exit_code_ptr):
+            exit_code_ptr._obj.value = 0  # process exited with code 0
+            return 1
+
+        mock_kernel32.GetExitCodeProcess.side_effect = _set_exited
+        with patch("ctypes.windll") as mock_windll:
+            mock_windll.kernel32 = mock_kernel32
+            assert is_process_alive(5678) is False
+        mock_kernel32.CloseHandle.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

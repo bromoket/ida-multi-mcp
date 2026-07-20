@@ -15,7 +15,7 @@ from .registry import InstanceRegistry
 from .router import InstanceRouter
 from .health import cleanup_stale_instances, rediscover_instances
 from .idalib_manager import IdalibManager
-from .tools import management, idalib as idalib_tools
+from .tools import management, idalib as idalib_tools, similarity
 from .cache import get_cache, DEFAULT_MAX_OUTPUT_CHARS
 
 # Static IDA tool schemas (loaded once at import time)
@@ -35,6 +35,56 @@ def _load_static_ida_tools() -> list[dict]:
                   file=sys.stderr)
             _STATIC_IDA_TOOLS = []
     return _STATIC_IDA_TOOLS
+
+
+def _json_text(value: Any) -> str:
+    return json.dumps(value, separators=(",", ":"))
+
+
+def _schema_preserving_preview(value: Any, max_chars: int) -> Any:
+    """Return a smaller value of the same JSON type (str/list/dict) when huge."""
+    if max_chars <= 0:
+        return value
+    try:
+        if len(_json_text(value)) <= max_chars:
+            return value
+    except Exception:
+        return value
+
+    if isinstance(value, str):
+        return value[:max_chars]
+
+    if isinstance(value, list):
+        # Accumulate serialized length per item instead of re-serializing
+        # the whole prefix each iteration (which is quadratic).
+        out: list[Any] = []
+        used = 2  # "[" and "]"
+        for item in value:
+            try:
+                item_len = len(_json_text(item))
+            except Exception:
+                break
+            used += item_len + (1 if out else 0)  # +1 for comma separator
+            if used > max_chars:
+                break
+            out.append(item)
+        return out
+
+    if isinstance(value, dict):
+        def _truncate(v: Any, depth: int = 0) -> Any:
+            if depth > 6:
+                return v
+            if isinstance(v, str) and len(v) > 1000:
+                return v[:1000] + f"... [{len(v)} chars total]"
+            if isinstance(v, list):
+                return [_truncate(x, depth + 1) for x in v[:50]]
+            if isinstance(v, dict):
+                return {k: _truncate(x, depth + 1) for k, x in v.items()}
+            return v
+
+        return _truncate(value)
+
+    return value
 
 
 class IdaMultiMcpServer:
@@ -71,6 +121,8 @@ class IdaMultiMcpServer:
         management.set_refresh_callback(self._refresh_tools)
         management.set_router(self.router)
         idalib_tools.set_manager(self.idalib_manager)
+        similarity.set_registry(self.registry)
+        similarity.set_router(self.router)
 
         # Register handlers
         self._register_handlers()
@@ -108,50 +160,6 @@ class IdaMultiMcpServer:
                 return structured.get("result")
 
             return structured
-
-        def _json_text(value: Any) -> str:
-            return json.dumps(value, separators=(",", ":"))
-
-        def _schema_preserving_preview(value: Any, max_chars: int) -> Any:
-            """Return a smaller value of the same JSON type (str/list/dict) when huge."""
-            if max_chars <= 0:
-                return value
-            try:
-                if len(_json_text(value)) <= max_chars:
-                    return value
-            except Exception:
-                return value
-
-            if isinstance(value, str):
-                return value[:max_chars]
-
-            if isinstance(value, list):
-                out: list[Any] = []
-                for item in value:
-                    out.append(item)
-                    try:
-                        if len(_json_text(out)) > max_chars:
-                            out.pop()
-                            break
-                    except Exception:
-                        break
-                return out
-
-            if isinstance(value, dict):
-                def _truncate(v: Any, depth: int = 0) -> Any:
-                    if depth > 6:
-                        return v
-                    if isinstance(v, str) and len(v) > 1000:
-                        return v[:1000] + f"... [{len(v)} chars total]"
-                    if isinstance(v, list):
-                        return [_truncate(x, depth + 1) for x in v[:50]]
-                    if isinstance(v, dict):
-                        return {k: _truncate(x, depth + 1) for k, x in v.items()}
-                    return v
-
-                return _truncate(value)
-
-            return value
 
         # Override tools/list to return cached tools
 
@@ -231,6 +239,15 @@ class IdaMultiMcpServer:
                     "content": [{"type": "text", "text": _json_text(result)}],
                     "structuredContent": result,
                     "isError": "error" in result
+                }
+
+            # Similarity tools (local, cross-instance capable)
+            elif name in similarity.TOOL_NAMES:
+                result = similarity.dispatch(name, arguments)
+                return {
+                    "content": [{"type": "text", "text": _json_text(result)}],
+                    "structuredContent": result,
+                    "isError": "error" in result,
                 }
 
             # idalib management tools (local)
@@ -357,6 +374,7 @@ class IdaMultiMcpServer:
         addrs = arguments.get("addrs", [])
         output_dir = arguments.get("output_dir", ".")
         mode = arguments.get("mode", "single")
+        allow_outside_cwd = arguments.get("allow_outside_cwd", False)
         instance_id = arguments.get("instance_id")
         if not instance_id:
             return {
@@ -369,7 +387,20 @@ class IdaMultiMcpServer:
         # Reject absolute paths that escape CWD unless they are subdirectories
         if ".." in os.path.normpath(output_dir).split(os.sep):
             return {"error": "output_dir must not contain '..' path components"}
-        # Warn but allow absolute paths (they may be intentional from the user)
+        # Security: confine output to the current working directory by default.
+        # Tool arguments here are LLM-generated, so an injected absolute path
+        # (e.g. a system directory) must not silently receive written files.
+        # Callers can opt out explicitly with allow_outside_cwd=true.
+        if not allow_outside_cwd:
+            cwd = os.path.realpath(os.getcwd())
+            if resolved_dir != cwd and not resolved_dir.startswith(cwd + os.sep):
+                return {
+                    "error": (
+                        "output_dir must be within the current working directory. "
+                        "Pass allow_outside_cwd=true to write elsewhere."
+                    ),
+                    "cwd": cwd,
+                }
         output_dir = resolved_dir
 
         # addr → name mapping (populated by list_funcs when using 'all')
@@ -617,11 +648,15 @@ class IdaMultiMcpServer:
                     },
                     "output_dir": {
                         "type": "string",
-                        "description": "Directory to save decompiled files"
+                        "description": "Directory to save decompiled files. Must be within the current working directory unless allow_outside_cwd is true."
                     },
                     "mode": {
                         "type": "string",
                         "description": "Output mode: 'single' = one .c file per function (default), 'merged' = all in one file"
+                    },
+                    "allow_outside_cwd": {
+                        "type": "boolean",
+                        "description": "Permit output_dir outside the current working directory (default: false)."
                     },
                     "instance_id": {
                         "type": "string",
@@ -631,6 +666,10 @@ class IdaMultiMcpServer:
                 "required": ["output_dir", "instance_id"]
             }
         }
+
+        # Register similarity tool schemas (always available; extraction is IDA-side)
+        for schema in similarity.SIMILARITY_TOOL_SCHEMAS:
+            self._tool_cache[schema["name"]] = schema.copy()
 
         # Register idalib management tool schemas (only if IDA Pro with idalib is available)
         from .idalib_manager import is_idalib_available
@@ -775,6 +814,7 @@ class IdaMultiMcpServer:
         if host not in ALLOWED_HOSTS:
             return []
 
+        conn = None
         try:
             conn = http.client.HTTPConnection(host, port, timeout=10.0)
             request_body = json.dumps({
@@ -785,7 +825,6 @@ class IdaMultiMcpServer:
             conn.request("POST", "/mcp", request_body, {"Content-Type": "application/json"})
             response = conn.getresponse()
             response_data = json.loads(response.read().decode())
-            conn.close()
 
             if "result" in response_data:
                 tools = response_data["result"].get("tools", [])
@@ -796,6 +835,9 @@ class IdaMultiMcpServer:
         except Exception as e:
             print(f"[ida-multi-mcp] Failed to discover tools from instance: {e}", file=sys.stderr)
             return []
+        finally:
+            if conn is not None:
+                conn.close()  # always release the socket, even on error
 
     def run(self):
         """Run the MCP server with stdio transport."""

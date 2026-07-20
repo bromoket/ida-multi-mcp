@@ -30,3 +30,14 @@ venv/
 # OS
 .DS_Store
 Thumbs.db
+
+# IDA Pro databases (regenerable analysis artifacts)
+*.i64
+*.id0
+*.id1
+*.id2
+*.nam
+*.til
+
+# Function-similarity benchmark run outputs (regenerable)
+bench/similarity/results/

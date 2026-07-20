@@ -29,11 +29,20 @@ def is_process_alive(pid: int) -> bool:
             import ctypes
             kernel32 = ctypes.windll.kernel32
             PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259  # GetExitCodeProcess return for a running process
             handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-            if handle:
-                kernel32.CloseHandle(handle)
+            if not handle:
+                return False
+            try:
+                # OpenProcess succeeds for a just-exited process whose handle is
+                # not yet released (a zombie). Confirm liveness via exit code.
+                exit_code = ctypes.c_ulong(0)
+                if kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                    return exit_code.value == STILL_ACTIVE
+                # Could not read exit code — assume alive (benefit of the doubt).
                 return True
-            return False
+            finally:
+                kernel32.CloseHandle(handle)
         except Exception:
             return False
     else:
@@ -63,6 +72,7 @@ def ping_instance(host: str, port: int, timeout: float = 15.0) -> bool:
     # Security: only allow localhost connections (prevent SSRF)
     if host not in _ALLOWED_HOSTS:
         return False
+    conn = None
     try:
         conn = http.client.HTTPConnection(host, port, timeout=timeout)
         request = json.dumps({
@@ -72,10 +82,12 @@ def ping_instance(host: str, port: int, timeout: float = 15.0) -> bool:
         })
         conn.request("POST", "/mcp", request, {"Content-Type": "application/json"})
         response = conn.getresponse()
-        conn.close()
         return response.status == 200
     except Exception:
         return False
+    finally:
+        if conn is not None:
+            conn.close()  # always release the socket, even on error
 
 
 def check_instance_health(instance: dict) -> bool:
@@ -153,6 +165,7 @@ def query_binary_metadata(host: str, port: int, timeout: float = 5.0) -> dict | 
     # Security: only allow localhost connections (prevent SSRF)
     if host not in _ALLOWED_HOSTS:
         return None
+    conn = None
     try:
         conn = http.client.HTTPConnection(host, port, timeout=timeout)
         request = json.dumps({
@@ -164,7 +177,6 @@ def query_binary_metadata(host: str, port: int, timeout: float = 5.0) -> dict | 
         conn.request("POST", "/mcp", request, {"Content-Type": "application/json"})
         response = conn.getresponse()
         data = json.loads(response.read().decode())
-        conn.close()
 
         # Extract metadata from resource response
         result = data.get("result", {})
@@ -174,6 +186,9 @@ def query_binary_metadata(host: str, port: int, timeout: float = 5.0) -> dict | 
             return json.loads(text)
     except Exception:
         pass
+    finally:
+        if conn is not None:
+            conn.close()  # always release the socket, even on error
     return None
 
 

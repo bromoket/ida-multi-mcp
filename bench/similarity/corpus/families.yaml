@@ -1,0 +1,39 @@
+# Ground-truth corpus manifest (SEED — expand after taxonomy review).
+#
+# family        = one semantic identity. All `members` are mutual POSITIVES
+#                 (hand-authored equivalents: Type-1..4 clones / refactors).
+# build matrix  = each member is compiled across {compiler} x {opt} x {strip},
+#                 and every such compiled instance is also a positive of the family.
+# hard_negatives= labeled confusers that should NOT match the family, chosen to
+#                 defeat one specific signal (structure / API / constant).
+# distractors   = unrelated functions used as generic negatives.
+#
+# The extractor resolves each name -> address per built binary via the symbol
+# table (before stripping), so ground truth survives into the stripped twin.
+
+families:
+  sum_array:
+    intent: "sum of an int array"
+    members: [sum_array, sum_array_while, sum_array_ptr]   # for/while/pointer refactors
+    hard_negatives: [xor_array]        # identical CFG/loop shape, different op -> defeats structure-only
+
+  parse_kv:
+    intent: "parse a 'key=<int>' pair"
+    members: [parse_kv, parse_kv_r]    # renamed vars + reordered stmts
+    hard_negatives: [parse_csv]        # shares strchr/strtol/loop, different logic -> defeats API-anchor
+
+  crc32:
+    intent: "reflected CRC-32, poly 0xEDB88320"
+    members: [crc32_bitwise, crc32_lut] # same identity, very different structure (Type-4 hard positive)
+    hard_negatives: [adler32]           # checksum loop, different constants/logic -> defeats 'looks like a hash loop'
+
+  adler32:
+    intent: "Adler-32 checksum, mod 65521"
+    members: [adler32]
+
+distractors: [max_array]               # unrelated family (branch-in-loop CFG), generic negatives
+
+sources:
+  arrays.c:    [sum_array, sum_array_while, sum_array_ptr, xor_array, max_array]
+  parse.c:     [parse_kv, parse_kv_r, parse_csv]
+  checksums.c: [crc32_bitwise, crc32_lut, adler32]

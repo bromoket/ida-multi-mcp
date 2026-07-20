@@ -3,12 +3,14 @@
 Manages the global registry of IDA Pro instances with atomic file operations.
 """
 
+import copy
 import ipaddress
 import json
 import os
 import stat
 import sys
 import tempfile
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -111,6 +113,14 @@ class InstanceRegistry:
         self.registry_path = registry_path
         self.lock_path = registry_path + ".lock"
 
+        # In-process read cache: avoids re-acquiring the file lock and
+        # re-parsing instances.json on every read. Writes go through
+        # _save (atomic os.replace), so a (mtime_ns, size, ino) signature
+        # reliably detects changes made by other processes.
+        self._cache_lock = threading.Lock()
+        self._cached_data: dict[str, Any] | None = None
+        self._cached_sig: tuple | None = None
+
         # Ensure parent directory exists with restrictive permissions
         registry_dir = os.path.dirname(self.registry_path)
         if not os.path.exists(registry_dir):
@@ -140,8 +150,51 @@ class InstanceRegistry:
             # Fallback: treat as very old (epoch 0)
             return 0.0
 
+    def _file_signature(self) -> tuple | None:
+        """Stat-based change signature of the registry file (None if missing)."""
+        try:
+            st = os.stat(self.registry_path)
+            return (st.st_mtime_ns, st.st_size, st.st_ino)
+        except OSError:
+            return None
+
+    def _cache_get(self, sig: tuple | None) -> dict[str, Any] | None:
+        """Return a copy of the cached data if *sig* matches, else None."""
+        if sig is None:
+            return None
+        with self._cache_lock:
+            if self._cached_data is not None and sig == self._cached_sig:
+                return copy.deepcopy(self._cached_data)
+        return None
+
+    def _cache_put(self, data: dict[str, Any], sig: tuple | None) -> None:
+        """Store *data* in the read cache under signature *sig*."""
+        if sig is None:
+            return
+        with self._cache_lock:
+            self._cached_data = copy.deepcopy(data)
+            self._cached_sig = sig
+
+    def _snapshot(self) -> dict[str, Any]:
+        """Read-only registry snapshot, served from cache when unchanged.
+
+        Lock-free on cache hit: _save uses atomic os.replace, so readers
+        never observe a partial file and the signature check is sufficient.
+        """
+        cached = self._cache_get(self._file_signature())
+        if cached is not None:
+            return cached
+        with FileLock(self.lock_path):
+            return self._load()
+
     def _load(self) -> dict[str, Any]:
         """Load registry data from disk (assumes lock held)."""
+        # Signature taken before reading: if the file changes mid-read we
+        # cache under a stale signature and simply re-read next time.
+        sig = self._file_signature()
+        cached = self._cache_get(sig)
+        if cached is not None:
+            return cached
         try:
             with open(self.registry_path, "r") as f:
                 data = json.load(f)
@@ -173,6 +226,7 @@ class InstanceRegistry:
                 valid_instances[iid] = entry
         data["instances"] = valid_instances
 
+        self._cache_put(data, sig)
         return data
 
     def _save(self, data: dict[str, Any]) -> None:
@@ -197,6 +251,8 @@ class InstanceRegistry:
             # Set restrictive file permissions on Unix
             if sys.platform != "win32":
                 os.chmod(self.registry_path, stat.S_IRUSR | stat.S_IWUSR)
+
+            self._cache_put(data, self._file_signature())
         finally:
             # Clean up temp file on failure
             if temp_fd is not None:
@@ -302,9 +358,7 @@ class InstanceRegistry:
         Returns:
             Instance metadata dict, or None if not found
         """
-        with FileLock(self.lock_path):
-            data = self._load()
-            return data["instances"].get(instance_id)
+        return self._snapshot()["instances"].get(instance_id)
 
     def list_instances(self) -> dict[str, dict[str, Any]]:
         """List all registered instances.
@@ -312,9 +366,7 @@ class InstanceRegistry:
         Returns:
             Dict mapping instance_id -> metadata
         """
-        with FileLock(self.lock_path):
-            data = self._load()
-            return data["instances"].copy()
+        return self._snapshot()["instances"]
 
     def update_heartbeat(self, instance_id: str) -> bool:
         """Update the last heartbeat timestamp for an instance.
@@ -341,9 +393,7 @@ class InstanceRegistry:
         Returns:
             Active instance ID, or None if no active instance
         """
-        with FileLock(self.lock_path):
-            data = self._load()
-            return data["active_instance"]
+        return self._snapshot()["active_instance"]
 
     def set_active(self, instance_id: str) -> bool:
         """Set the active instance.
@@ -412,9 +462,7 @@ class InstanceRegistry:
         Returns:
             Expired instance metadata dict, or None if not found
         """
-        with FileLock(self.lock_path):
-            data = self._load()
-            return data.get("expired", {}).get(instance_id)
+        return self._snapshot().get("expired", {}).get(instance_id)
 
     def cleanup_expired(self, max_age_seconds: int = 3600) -> int:
         """Remove expired instances older than max_age.

@@ -78,23 +78,32 @@ def get_cors_policy(port: int) -> str:
 ORIGINAL_TOOLS = handle_enabled_tools(MCP_SERVER.tools, "enabled_tools")
 
 
-class IdaMcpHttpRequestHandler(McpHttpRequestHandler):
-    def __init__(self, request, client_address, server):
-        super().__init__(request, client_address, server)
-        self.update_cors_policy()
+def apply_cors_policy(server, policy: str | None = None) -> None:
+    """Apply the configured CORS policy to *server.cors_allowed_origins*.
 
-    def update_cors_policy(self):
+    Reads the policy from config when not supplied. This is the only place
+    that touches the IDA netnode for CORS, so it must NOT run per request —
+    call it once at startup and again from the /config handler on change.
+    """
+    if policy is None:
         policy = config_json_get("cors_policy", DEFAULT_CORS_POLICY)
-        if policy not in ("unrestricted", "local", "direct"):
-            policy = DEFAULT_CORS_POLICY
-        match policy:
-            case "unrestricted":
-                self.mcp_server.cors_allowed_origins = "*"
-            case "local":
-                self.mcp_server.cors_allowed_origins = self.mcp_server.cors_localhost
-            case "direct":
-                self.mcp_server.cors_allowed_origins = None
+    if policy not in ("unrestricted", "local", "direct"):
+        policy = DEFAULT_CORS_POLICY
+    match policy:
+        case "unrestricted":
+            server.cors_allowed_origins = "*"
+        case "local":
+            server.cors_allowed_origins = server.cors_localhost
+        case "direct":
+            server.cors_allowed_origins = None
 
+
+# Resolve the CORS policy once at import (mirrors handle_enabled_tools above),
+# instead of doing an @idasync netnode read on every HTTP request.
+apply_cors_policy(MCP_SERVER)
+
+
+class IdaMcpHttpRequestHandler(McpHttpRequestHandler):
     def do_POST(self):
         """Handles POST requests."""
         if urlparse(self.path).path == "/config":
@@ -385,7 +394,7 @@ input[type="submit"]:hover {
         # Update CORS policy
         cors_policy = postvars.get("cors_policy", [DEFAULT_CORS_POLICY])[0]
         config_json_set("cors_policy", cors_policy)
-        self.update_cors_policy()
+        apply_cors_policy(self.mcp_server, cors_policy)
 
         # Update the server's tools
         enabled_tools = {name: name in postvars for name in ORIGINAL_TOOLS.keys()}

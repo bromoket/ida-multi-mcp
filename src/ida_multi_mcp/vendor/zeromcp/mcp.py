@@ -1,3 +1,11 @@
+# Vendored zeromcp for the router (stdio transport, IDA-free).
+#
+# A second copy lives at ida_multi_mcp/ida_mcp/zeromcp/mcp.py and is used by the
+# IDA plugin/worker over HTTP. The two are deliberately separate: the router
+# must not import ida_mcp (which pulls in IDA dependencies), and some behavior is
+# transport-specific — this copy logs to stderr (stdout is the stdio protocol
+# channel), whereas the HTTP copy logs to stdout. Keep shared, transport-neutral
+# fixes mirrored across both copies.
 import re
 import sys
 import time
@@ -431,13 +439,19 @@ class McpServer:
                 request = stdin.readline(self._STDIO_MAX_LINE + 1)
                 if not request: # EOF
                     break
-                if len(request) > self._STDIO_MAX_LINE:
-                    # Security: reject oversized lines to prevent memory exhaustion
-                    continue
 
                 # Strip whitespace (trailing newline) before parsing
                 request = request.strip()
                 if not request:
+                    continue
+
+                # Security: reject oversized lines. Reply with an error rather
+                # than silently dropping, so the client does not hang waiting.
+                if len(request) > self._STDIO_MAX_LINE:
+                    response = self.registry._error(None, -32600, "Request too large")
+                    if response:
+                        stdout.write(json.dumps(response).encode("utf-8") + b"\n")
+                        stdout.flush()
                     continue
 
                 response = self.registry.dispatch(request)

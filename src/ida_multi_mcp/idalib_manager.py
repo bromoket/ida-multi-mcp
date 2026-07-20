@@ -143,12 +143,17 @@ class IdalibManager:
 
         creation_flags = 0
         if sys.platform == "win32":
-            creation_flags = subprocess.CREATE_NO_WINDOW
+            # NEW_PROCESS_GROUP lets us send CTRL_BREAK_EVENT for graceful
+            # shutdown (TerminateProcess cannot be caught to close the IDB).
+            creation_flags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
 
         try:
+            # stdout is discarded: the worker logs via stderr, and leaving an
+            # undrained PIPE deadlocks the worker once IDA's analysis output
+            # fills the OS pipe buffer (~64KB) during _wait_for_ready.
             proc = subprocess.Popen(
                 cmd,
-                stdout=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 creationflags=creation_flags,
             )
@@ -219,19 +224,58 @@ class IdalibManager:
                 return {"ok": True, "note": "orphaned entry removed"}
             return {"error": f"Instance '{instance_id}' is not a managed idalib session"}
 
-        # Terminate the subprocess.
-        try:
-            proc.terminate()
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=5)
-        except Exception:
-            proc.kill()
+        # Terminate the subprocess, preferring a graceful shutdown so the
+        # worker can close its IDB cleanly.
+        self._terminate_gracefully(proc)
 
         del self._processes[instance_id]
         self.registry.unregister(instance_id)
         return {"ok": True}
+
+    @staticmethod
+    def _terminate_gracefully(proc: subprocess.Popen) -> None:
+        """Ask the worker to shut down cleanly, then force-kill if it lingers.
+
+        On Windows, ``proc.terminate()`` maps to TerminateProcess, which the
+        worker cannot intercept to close its IDB. Send CTRL_BREAK_EVENT first
+        (handled as SIGBREAK by the worker) and fall back to terminate/kill.
+        On POSIX, SIGTERM already triggers the worker's clean-shutdown handler.
+        """
+        if proc.poll() is not None:
+            return
+
+        # Step 1: graceful request (CTRL_BREAK on Windows, SIGTERM on POSIX).
+        try:
+            if sys.platform == "win32":
+                import signal as _signal
+                proc.send_signal(_signal.CTRL_BREAK_EVENT)
+            else:
+                proc.terminate()
+            proc.wait(timeout=10)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        except Exception:
+            pass
+
+        # Step 2 (Windows only): TerminateProcess, since CTRL_BREAK may be
+        # ignored. On POSIX the graceful step already sent SIGTERM, so go
+        # straight to the hard kill below instead of repeating terminate().
+        if sys.platform == "win32":
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+                return
+            except subprocess.TimeoutExpired:
+                pass
+            except Exception:
+                pass
+
+        # Step 3: hard kill.
+        try:
+            proc.kill()
+        except Exception:
+            pass
 
     def close_all_sessions(self) -> int:
         """Terminate all managed idalib workers. Returns count closed."""

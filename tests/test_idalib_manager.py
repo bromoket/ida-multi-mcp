@@ -151,6 +151,44 @@ class TestIdalibManagerClose:
         assert "error" in result
 
 
+class TestGracefulTermination:
+    def test_skips_already_exited(self):
+        proc = MagicMock()
+        proc.poll.return_value = 0  # already exited
+        IdalibManager._terminate_gracefully(proc)
+        proc.wait.assert_not_called()
+        proc.kill.assert_not_called()
+
+    def test_graceful_signal_then_wait(self):
+        proc = MagicMock()
+        proc.poll.return_value = None
+        IdalibManager._terminate_gracefully(proc)
+        # Graceful path: no force-kill needed.
+        proc.wait.assert_called_once()
+        proc.kill.assert_not_called()
+
+    def test_falls_back_to_kill_on_timeout(self):
+        proc = MagicMock()
+        proc.poll.return_value = None
+        # Both graceful and terminate waits time out → hard kill.
+        proc.wait.side_effect = subprocess.TimeoutExpired(cmd="worker", timeout=10)
+        IdalibManager._terminate_gracefully(proc)
+        proc.terminate.assert_called_once()
+        proc.kill.assert_called_once()
+
+    @patch("ida_multi_mcp.idalib_manager.sys.platform", "win32")
+    def test_windows_uses_ctrl_break(self):
+        import signal
+        # CTRL_BREAK_EVENT only exists on Windows; create it so the win32 code
+        # path is exercisable on Linux/macOS CI runners too.
+        sentinel = getattr(signal, "CTRL_BREAK_EVENT", 1)
+        with patch.object(signal, "CTRL_BREAK_EVENT", sentinel, create=True):
+            proc = MagicMock()
+            proc.poll.return_value = None
+            IdalibManager._terminate_gracefully(proc)
+            proc.send_signal.assert_called_once_with(sentinel)
+
+
 class TestIdalibManagerList:
     @patch("ida_multi_mcp.idalib_manager.subprocess.Popen")
     @patch("ida_multi_mcp.idalib_manager.ping_instance", return_value=True)

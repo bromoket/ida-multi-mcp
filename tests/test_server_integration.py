@@ -103,6 +103,37 @@ class TestDecompileToFile:
         if "error" in structured:
             assert ".." in structured["error"]
 
+    def test_absolute_path_outside_cwd_rejected(self, server, tmp_path):
+        result = server._handle_decompile_to_file({
+            "output_dir": str(tmp_path),  # outside the project cwd
+            "instance_id": "x",
+            "addrs": ["0x1000"],
+        })
+        assert "error" in result
+        assert "current working directory" in result["error"]
+
+    def test_allow_outside_cwd_bypasses_check(self, server, tmp_path):
+        # With the opt-out, the cwd check passes; it then fails later for a
+        # different reason (no addresses), proving validation was bypassed.
+        result = server._handle_decompile_to_file({
+            "output_dir": str(tmp_path),
+            "allow_outside_cwd": True,
+            "instance_id": "x",
+            "addrs": [],
+        })
+        assert "error" in result
+        assert "current working directory" not in result["error"]
+
+    def test_cwd_relative_dir_accepted(self, server):
+        # "." resolves to cwd → passes the cwd guard, fails on no addresses.
+        result = server._handle_decompile_to_file({
+            "output_dir": ".",
+            "instance_id": "x",
+            "addrs": [],
+        })
+        assert "error" in result
+        assert "current working directory" not in result["error"]
+
 
 class TestProxiedTruncation:
     def test_response_truncation_and_caching(self, server):
@@ -129,3 +160,38 @@ class TestProxiedTruncation:
         text = result["content"][0]["text"]
         assert "TRUNCATED" in text
         assert "cache_id" in text
+
+
+# ---------------------------------------------------------------------------
+# _schema_preserving_preview (module-level helper)
+# ---------------------------------------------------------------------------
+class TestSchemaPreservingPreview:
+    def test_small_value_returned_unchanged(self):
+        from ida_multi_mcp.server import _schema_preserving_preview
+        value = [1, 2, 3]
+        assert _schema_preserving_preview(value, 1000) is value
+
+    def test_list_truncated_to_budget(self):
+        from ida_multi_mcp.server import _schema_preserving_preview, _json_text
+        value = [{"name": f"func_{i:04d}", "addr": hex(0x400000 + i)} for i in range(500)]
+        result = _schema_preserving_preview(value, 1000)
+        assert isinstance(result, list)
+        assert 0 < len(result) < 500
+        assert len(_json_text(result)) <= 1000
+        # Items preserved verbatim, in order.
+        assert result == value[: len(result)]
+
+    def test_string_truncated(self):
+        from ida_multi_mcp.server import _schema_preserving_preview
+        assert _schema_preserving_preview("x" * 100, 10) == "x" * 10
+
+    def test_linear_not_quadratic(self):
+        """A large list must truncate quickly (was O(n^2) re-serialization)."""
+        import time
+        from ida_multi_mcp.server import _schema_preserving_preview
+        value = [{"k": i, "data": "y" * 50} for i in range(50_000)]
+        start = time.monotonic()
+        result = _schema_preserving_preview(value, 10_000)
+        elapsed = time.monotonic() - start
+        assert elapsed < 1.0
+        assert len(result) < len(value)

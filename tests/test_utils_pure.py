@@ -33,7 +33,7 @@ _SUBMODULES = [
     "rpc", "http", "framework",
     "api_core", "api_analysis", "api_memory", "api_types",
     "api_modify", "api_stack", "api_debug", "api_python", "api_resources",
-    "api_survey", "api_composite", "api_sigmaker", "compat",
+    "api_survey", "api_composite", "api_sigmaker", "api_similarity", "compat",
 ]
 
 # Create a real sync stub with IDAError
@@ -59,6 +59,7 @@ for _sub in _SUBMODULES:
 # The __init__.py imports of api_* etc. will hit our MagicMock stubs harmlessly.
 from ida_multi_mcp.ida_mcp.utils import (
     compact_whitespace,
+    get_function,
     parse_address,
     normalize_list_input,
     normalize_dict_list,
@@ -113,10 +114,23 @@ class TestBssSafeReads:
         load_map = {0x1000: True, 0x1001: False, 0x1002: True, 0x1003: False}
         value_map = {0x1000: 0x41, 0x1002: 0x43}
 
+        # Region has a BSS gap → bulk get_bytes returns None → slow path.
+        utils.ida_bytes.get_bytes.return_value = None
         utils.ida_bytes.is_loaded.side_effect = lambda ea: load_map.get(ea, False)
         utils.ida_bytes.get_byte.side_effect = lambda ea: value_map[ea]
 
         assert read_bytes_bss_safe(0x1000, 4) == b"A\x00C\x00"
+
+    def test_read_bytes_bss_safe_fast_path_when_loaded(self):
+        # Whole range loaded → single get_bytes call, no per-byte loop.
+        utils.ida_bytes.get_bytes.side_effect = None
+        utils.ida_bytes.get_bytes.return_value = b"ABCD"
+        utils.ida_bytes.get_byte.side_effect = AssertionError("slow path used")
+
+        assert read_bytes_bss_safe(0x1000, 4) == b"ABCD"
+
+    def test_read_bytes_bss_safe_zero_size(self):
+        assert read_bytes_bss_safe(0x1000, 0) == b""
 
     def test_read_int_bss_safe_returns_zero_for_unloaded_start(self):
         utils.ida_bytes.is_loaded.side_effect = lambda ea: False
@@ -132,6 +146,29 @@ class TestBssSafeReads:
 
         assert read_int_bss_safe(0x3000, 8) == 0x1122334455667788
         utils.ida_bytes.get_qword.assert_called_once_with(0x3000)
+
+
+class TestGetFunction:
+    def test_mid_function_address_returns_canonical_start(self):
+        fn = MagicMock()
+        fn.start_ea = 0x401000
+        fn.end_ea = 0x401080
+        fn.get_name.return_value = "sub_401000"
+        utils.idaapi.get_func.return_value = fn
+
+        result = get_function(0x401034)  # address inside the function body
+
+        assert result["addr"] == "0x401000"
+        assert result["size"] == "0x80"
+
+    def test_missing_function_returns_none_when_not_raising(self):
+        utils.idaapi.get_func.return_value = None
+        assert get_function(0xDEAD, raise_error=False) is None
+
+    def test_missing_function_raises_by_default(self):
+        utils.idaapi.get_func.return_value = None
+        with pytest.raises(IDAError, match="No function found"):
+            get_function(0xDEAD)
 
 
 class TestCompactWhitespace:

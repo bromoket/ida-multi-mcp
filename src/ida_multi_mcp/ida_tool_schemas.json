@@ -438,6 +438,10 @@
               "additionalProperties": false
             }
           ]
+        },
+        "limit": {
+          "type": "integer",
+          "description": "Max xrefs per field (default: 100, max: 1000)"
         }
       },
       "required": [
@@ -2993,6 +2997,88 @@
       },
       "required": [],
       "additionalProperties": false
+    }
+  },
+  {
+    "name": "func_features",
+    "description": "Extract name-independent similarity features for functions, page by page. Per function: size, is_named, CFG metrics (bb/edge/complexity/loops/callee/caller counts + out-degree sequence), a 64-perm instruction-shingle MinHash, external API (import) callees, referenced strings, non-trivial immediate constants, and (named functions only) pseudocode identifier tokens. Use '*' for all functions; only the page slice is analyzed so large binaries stay bounded.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "addrs": {
+          "anyOf": [
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "description": "Function addresses (comma-separated or list), or '*' for all"
+        },
+        "offset": {
+          "type": "integer",
+          "description": "Skip first N functions (default: 0)"
+        },
+        "count": {
+          "type": "integer",
+          "description": "Max functions per page (default: 500, max: 2000)"
+        }
+      },
+      "required": []
+    },
+    "outputSchema": {
+      "type": "object"
+    }
+  },
+  {
+    "name": "binary_fingerprint",
+    "description": "Content fingerprint of the loaded binary for similarity index keying: input file sha256 and md5 (hex, or null if unavailable), total function count, and an arch label (e.g. 'x86_64').",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "required": []
+    },
+    "outputSchema": {
+      "type": "object"
+    }
+  },
+  {
+    "name": "func_tokens",
+    "description": "Emit jTrans-style normalized instruction token streams per function (for a neural BCSD embedding backend), page by page. Uses IDA's operand normalization: registers kept, immediates/displacements -> CONST, stack vars -> var_xxx/arg_xxx, intra-function jumps -> JUMP_ADDR_<idx>. Use '*' for all functions; only the page slice is analyzed. Returns {addr: [token, ...]}.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "addrs": {
+          "anyOf": [
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "description": "Function addresses (comma-separated or list), or '*' for all"
+        },
+        "offset": {
+          "type": "integer",
+          "description": "Skip first N functions (default: 0)"
+        },
+        "count": {
+          "type": "integer",
+          "description": "Max functions per page (default: 500, max: 2000)"
+        }
+      },
+      "required": []
+    },
+    "outputSchema": {
+      "type": "object"
     }
   }
 ]

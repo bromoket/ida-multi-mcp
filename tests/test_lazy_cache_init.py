@@ -102,7 +102,7 @@ def ida_mcp_modules(monkeypatch):
         lambda value, str_to_dict=None, max_items=500:
         value if isinstance(value, list) else [value if not isinstance(value, str) else str_to_dict(value)]
     )
-    utils.get_function = lambda addr: {"addr": hex(addr), "name": f"sub_{addr:x}"}
+    utils.get_function = lambda addr: {"addr": hex(addr), "name": f"sub_{addr:x}", "size": "0x40"}
     utils.paginate = lambda data, offset, count: {
         "data": data[offset:] if count == 0 else data[offset:offset + count],
         "next_offset": None,
@@ -172,6 +172,56 @@ class TestApiCoreLazyCaches:
         api_core, _ = ida_mcp_modules
 
         assert getattr(api_core.refresh_caches, "__ida_mcp_timeout_sec__", None) == 120.0
+
+    def test_func_query_builds_cache_once(self, ida_mcp_modules):
+        api_core, _ = ida_mcp_modules
+        api_core._funcs_cache = None
+        api_core._funcs_query_cache = None
+        api_core.idautils.Functions.return_value = [0x1000, 0x2000]
+        api_core.ida_nalt.get_tinfo.return_value = False
+
+        first = api_core.func_query({"offset": 0, "count": 50})
+        second = api_core.func_query({"offset": 0, "count": 50})
+
+        # Functions() iterated once (via the funcs cache); second call reuses it.
+        assert api_core.idautils.Functions.call_count == 1
+        assert first == second
+        assert first[0]["data"][0]["addr"] == "0x1000"
+        # size_int is stripped from output; has_type is resolved per-row.
+        assert "size_int" not in first[0]["data"][0]
+        assert first[0]["data"][0]["has_type"] is False
+
+    def test_func_query_does_not_scan_types_when_unfiltered(self, ida_mcp_modules):
+        """has_type must be resolved only for returned rows, not all functions."""
+        api_core, _ = ida_mcp_modules
+        api_core._funcs_cache = None
+        api_core._funcs_query_cache = None
+        api_core.idautils.Functions.return_value = list(range(0x1000, 0x1000 + 100))
+        api_core.ida_nalt.get_tinfo.reset_mock()
+        api_core.ida_nalt.get_tinfo.return_value = False
+
+        api_core.func_query({"offset": 0, "count": 5})
+
+        # Only the 5 returned rows get a get_tinfo call, not all 100 functions.
+        assert api_core.ida_nalt.get_tinfo.call_count == 5
+
+    def test_func_query_cache_invalidated_with_funcs_cache(self, ida_mcp_modules):
+        api_core, _ = ida_mcp_modules
+        api_core._funcs_query_cache = [{"addr": "0xdead", "name": "x",
+                                        "size": "0x1", "size_int": 1}]
+        api_core.invalidate_funcs_cache()
+        assert api_core._funcs_query_cache is None
+
+    def test_func_query_sort_does_not_mutate_cache(self, ida_mcp_modules):
+        api_core, _ = ida_mcp_modules
+        api_core._funcs_cache = None
+        api_core._funcs_query_cache = None
+        api_core.idautils.Functions.return_value = [0x2000, 0x1000]
+        api_core.ida_nalt.get_tinfo.return_value = False
+
+        api_core.func_query({"sort_by": "addr"})
+        # Cache must remain in original Functions() order, not sorted order.
+        assert [r["addr"] for r in api_core._funcs_query_cache] == ["0x2000", "0x1000"]
 
 
 class TestApiModifyCacheInvalidation:
