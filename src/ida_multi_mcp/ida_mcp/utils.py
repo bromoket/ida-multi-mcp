@@ -796,6 +796,14 @@ def pattern_filter(data: list[T], pattern: str, key: str) -> list[T]:
     if not pattern:
         return data
 
+    # JSON callers can pass a non-string here (int, list, dict); without this
+    # the len()/startswith() below raise a bare TypeError that surfaces as an
+    # opaque internal error. Cf. mrexodia/ida-pro-mcp#353.
+    if not isinstance(pattern, str):
+        raise IDAError(
+            f"Pattern must be a string, got {type(pattern).__name__}"
+        )
+
     # Security: limit pattern length to prevent ReDoS
     if len(pattern) > _MAX_PATTERN_LENGTH:
         raise IDAError(f"Pattern too long: maximum {_MAX_PATTERN_LENGTH} characters")
