@@ -3,6 +3,7 @@ import queue
 import functools
 import os
 import sys
+import threading
 import time
 from enum import IntEnum
 import idaapi
@@ -106,8 +107,21 @@ def reset_batch_mode() -> dict:
     previous_depth = _batch_depth
     _batch_depth = 0
     _batch_saved = 0
-    idc.batch(0)
-    return {"ok": True, "previous_depth": previous_depth, "batch": 0}
+    # idc.batch() returns the value it replaced -- report it, since that is the
+    # number that actually says whether IDA was muted. A previous_batch of 1
+    # with previous_depth 0 means a genuine leak (dialogs were dead and our
+    # counter had already unwound); depth > 0 means a call was still in flight.
+    previous_batch = idc.batch(0)
+    # Native cancellation is sticky too, and a stranded flag makes every SDK
+    # call bail instantly -- clear it as part of getting unstuck.
+    ida_kernwin.clr_cancelled()
+    return {
+        "ok": True,
+        "previous_depth": previous_depth,
+        "previous_batch": int(previous_batch),
+        "was_stuck": bool(previous_batch) and previous_depth == 0,
+        "batch": 0,
+    }
 
 
 def _sync_wrapper(ff):
@@ -175,10 +189,38 @@ def sync_wrapper(ff, timeout_override: float | None = None):
             # not when the request was queued (avoids stale deadlines)
             deadline = time.monotonic() + timeout if timeout > 0 else None
 
+            # Native cancellation. The setprofile hook below only runs between
+            # *Python* bytecodes, so it cannot preempt a pure-C SDK call --
+            # ida_bytes.find_bytes on a large IDB holds the main thread well
+            # past the deadline, and every queued tool call times out behind
+            # it. Many SDK calls poll user_cancelled() and bail with BADADDR /
+            # MERR_CANCELED within a poll cycle (ida_search.find_*,
+            # find_bytes/bin_search, decompile*, build_strlist, auto_wait), so
+            # firing set_cancelled() at the deadline frees the main thread.
+            # set_cancelled() is documented THREAD_SAFE, hence the Timer.
+            # Ported from mrexodia/ida-pro-mcp 55533c47 (issue #235).
+            ida_kernwin.clr_cancelled()  # drop any stale flag
+            cancel_fired_at: list[float | None] = [None]
+            native_timer: threading.Timer | None = None
+            if deadline is not None:
+                def _fire_native_cancel():
+                    cancel_fired_at[0] = time.monotonic()
+                    ida_kernwin.set_cancelled()
+
+                native_timer = threading.Timer(timeout, _fire_native_cancel)
+                native_timer.daemon = True
+                native_timer.start()
+
             def profilefunc(frame, event, arg):
-                # Check cancellation first (higher priority)
+                # Check request-level cancellation first (higher priority)
                 if cancel_event is not None and cancel_event.is_set():
                     raise CancelledError("Request was cancelled")
+                # If the native cancel just fired, give the tool a short grace
+                # window to format a partial response instead of racing the
+                # IDASyncError. Beyond that we still raise, to bound latency.
+                fired_at = cancel_fired_at[0]
+                if fired_at is not None and time.monotonic() < fired_at + 5.0:
+                    return
                 if deadline is not None and time.monotonic() >= deadline:
                     raise IDASyncError(f"Tool timed out after {timeout:.2f}s")
 
@@ -188,6 +230,12 @@ def sync_wrapper(ff, timeout_override: float | None = None):
                 return ff()
             finally:
                 sys.setprofile(old_profile)
+                if native_timer is not None:
+                    native_timer.cancel()
+                # The cancelled flag is sticky: without an unconditional
+                # clear, every later user_cancelled() returns True forever and
+                # each subsequent tool aborts instantly.
+                ida_kernwin.clr_cancelled()
 
         timed_ff.__name__ = ff.__name__
         return _sync_wrapper(timed_ff)

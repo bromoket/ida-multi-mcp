@@ -71,6 +71,8 @@ def sync(monkeypatch):
         m.__path__ = []  # mark as a package so submodule imports resolve
         return m
 
+    ida_kernwin = MagicMock()
+
     rpc_stub = types.ModuleType(f"{_PKG}.rpc")
     rpc_stub.McpToolError = type("McpToolError", (Exception,), {})
 
@@ -81,7 +83,7 @@ def sync(monkeypatch):
     for name, mod in {
         "idaapi": idaapi,
         "idc": fake_idc,
-        "ida_kernwin": MagicMock(),
+        "ida_kernwin": ida_kernwin,
         "ida_multi_mcp": _pkg("ida_multi_mcp"),
         _PKG: _pkg(_PKG),
         f"{_PKG}.zeromcp": _pkg(f"{_PKG}.zeromcp"),
@@ -99,6 +101,7 @@ def sync(monkeypatch):
     spec.loader.exec_module(mod)
 
     mod._fake_idc = fake_idc  # expose for assertions
+    mod._fake_kernwin = ida_kernwin
     yield mod
 
 
@@ -172,6 +175,9 @@ def test_reset_batch_mode_recovers_a_stuck_session(sync):
     assert idc.value == 0
     assert result["ok"] is True
     assert result["previous_depth"] == 2
+    assert result["previous_batch"] == 1, "must report the flag it actually replaced"
+    # depth was non-zero, so a call was in flight -- not a genuine leak
+    assert result["was_stuck"] is False
     # And the counter is clean, so normal calls work again afterwards.
     sync._enter_batch()
     sync._leave_batch()
@@ -260,3 +266,92 @@ def test_reentrant_call_raises_instead_of_blocking(sync):
 
     # Critically, the failed reentrant call must still leave the UI usable.
     assert sync._fake_idc.value == 0, "a reentrancy error must not strand batch mode"
+
+
+# ---------------------------------------------------------------------------
+# Native cancellation at the tool deadline
+# ---------------------------------------------------------------------------
+# The setprofile hook only runs between Python bytecodes, so it cannot preempt
+# a pure-C SDK call. ida_kernwin.set_cancelled() is fired from a Timer at the
+# deadline so SDK calls that poll user_cancelled() bail out and free the IDA
+# main thread. Ported from mrexodia/ida-pro-mcp 55533c47 (issue #235).
+
+
+def test_native_cancel_flag_cleared_on_entry_and_exit(sync, monkeypatch):
+    """The cancelled flag is sticky -- it MUST be cleared around every call.
+
+    Without the unconditional clear, one timed-out tool poisons every
+    subsequent SDK call: user_cancelled() keeps returning True and each tool
+    aborts instantly for the rest of the session.
+    """
+    monkeypatch.setenv("IDA_MCP_TOOL_TIMEOUT_SEC", "30")
+    kernwin = sync._fake_kernwin
+    kernwin.reset_mock()
+
+    @sync.idasync
+    def tool():
+        return "ok"
+
+    assert tool() == "ok"
+    assert kernwin.clr_cancelled.call_count >= 2, (
+        "expected a clear on entry (drop stale flag) and on exit (unstick)"
+    )
+    kernwin.set_cancelled.assert_not_called()
+
+
+def test_native_cancel_not_fired_for_fast_tool(sync, monkeypatch):
+    """A tool that finishes well inside its deadline must cancel its timer."""
+    monkeypatch.setenv("IDA_MCP_TOOL_TIMEOUT_SEC", "30")
+    kernwin = sync._fake_kernwin
+    kernwin.reset_mock()
+
+    @sync.idasync
+    def quick():
+        return 42
+
+    assert quick() == 42
+    import time as _t
+    _t.sleep(0.2)  # a leaked timer would have plenty of runway here
+    kernwin.set_cancelled.assert_not_called()
+
+
+def test_native_cancel_fires_at_deadline(sync, monkeypatch):
+    """A tool that overruns its deadline gets set_cancelled() from the Timer."""
+    monkeypatch.setenv("IDA_MCP_TOOL_TIMEOUT_SEC", "0.15")
+    kernwin = sync._fake_kernwin
+    kernwin.reset_mock()
+
+    import time as _t
+
+    @sync.idasync
+    def slow():
+        # Pure sleep: no Python bytecode churn, so the profile hook cannot
+        # preempt it -- exactly the scenario a native cancel exists for.
+        _t.sleep(0.6)
+        return "done"
+
+    try:
+        slow()
+    except Exception:
+        pass  # raising past the grace window is acceptable; the flag is the point
+
+    kernwin.set_cancelled.assert_called()
+    # And it still gets unstuck afterwards.
+    assert kernwin.clr_cancelled.call_count >= 2
+
+
+def test_reset_batch_mode_flags_a_genuine_leak(sync):
+    """previous_batch=1 with previous_depth=0 is the real-leak fingerprint.
+
+    Dialogs were dead (flag set) but our counter had already unwound, so
+    nothing was in flight -- exactly the state the original bug left behind.
+    """
+    idc = sync._fake_idc
+    idc.batch(1)  # simulate a stranded flag with a clean counter
+
+    result = sync.reset_batch_mode()
+
+    assert result["previous_batch"] == 1
+    assert result["previous_depth"] == 0
+    assert result["was_stuck"] is True
+    assert idc.value == 0
