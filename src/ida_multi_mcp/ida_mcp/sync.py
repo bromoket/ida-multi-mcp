@@ -54,6 +54,61 @@ def _get_tool_timeout_seconds() -> float:
 
 call_stack = queue.LifoQueue()
 
+# ---------------------------------------------------------------------------
+# Batch-mode handling
+# ---------------------------------------------------------------------------
+# Batch mode (idc.batch(1)) suppresses IDA's modal dialogs so a tool call can
+# never block the UI waiting for user input. It is a *global, process-wide*
+# flag, so it must be handled carefully:
+#
+#   1. It is toggled on the IDA main thread only (inside execute_sync). IDA's
+#      API is not thread-safe, and the previous code called idc.batch() from
+#      the RPC worker thread.
+#   2. Nesting is reference-counted against a single saved "outer" value. The
+#      previous save/restore was per-call, so two overlapping requests would
+#      interleave as: A saves 0, B saves 1 (A's value), A restores 0,
+#      B restores 1 -- leaving batch mode stuck ON for the rest of the
+#      session. That silently disables *every* IDA dialog, including ones the
+#      plugin never touches: the "g" jump-to-address box, the script chooser,
+#      and the save-on-close prompt.
+#
+# _batch_depth/_batch_saved are only ever touched on the main thread, which
+# execute_sync serializes, so no extra locking is needed.
+_batch_depth = 0
+_batch_saved = 0
+
+
+def _enter_batch() -> None:
+    """Enable batch mode, remembering the caller's value on the outermost entry."""
+    global _batch_depth, _batch_saved
+    if _batch_depth == 0:
+        _batch_saved = idc.batch(1)
+    _batch_depth += 1
+
+
+def _leave_batch() -> None:
+    """Restore the original batch value once the outermost call unwinds."""
+    global _batch_depth
+    if _batch_depth > 0:
+        _batch_depth -= 1
+    if _batch_depth == 0:
+        idc.batch(_batch_saved)
+
+
+def reset_batch_mode() -> dict:
+    """Force batch mode off and clear the nesting counter.
+
+    Recovery hatch: if batch mode ever leaks (a hard crash on the main thread
+    between _enter_batch and _leave_batch), IDA stops showing dialogs until
+    restart. This restores it without losing the session.
+    """
+    global _batch_depth, _batch_saved
+    previous_depth = _batch_depth
+    _batch_depth = 0
+    _batch_saved = 0
+    idc.batch(0)
+    return {"ok": True, "previous_depth": previous_depth, "batch": 0}
+
 
 def _sync_wrapper(ff):
     """Call a function ff with a specific IDA safety_mode."""
@@ -62,17 +117,30 @@ def _sync_wrapper(ff):
 
     def runned():
         if not call_stack.empty():
-            last_func_name = call_stack.get()
+            # Non-blocking: a reentrant @idasync invoked synchronously inside
+            # another ff() may have already popped this entry. A blocking get()
+            # here would park the IDA main thread on an empty queue forever,
+            # which also strands the batch-mode restore below (upstream #406).
+            try:
+                last_func_name = call_stack.get_nowait()
+            except queue.Empty:
+                last_func_name = "<unknown>"
             error_str = f"Call stack is not empty while calling the function {ff.__name__} from {last_func_name}"
             raise IDASyncError(error_str)
 
         call_stack.put((ff.__name__))
+        # Toggle batch mode here: this runs on the IDA main thread.
+        _enter_batch()
         try:
             res_container.put(ff())
         except Exception as x:
             res_container.put(x)
         finally:
-            call_stack.get()
+            _leave_batch()
+            try:
+                call_stack.get_nowait()
+            except queue.Empty:
+                pass
 
     idaapi.execute_sync(runned, idaapi.MFF_WRITE)
     res = res_container.get()
@@ -90,40 +158,40 @@ def _normalize_timeout(value: object) -> float | None:
 
 
 def sync_wrapper(ff, timeout_override: float | None = None):
-    """Wrapper to enable batch mode during IDA synchronization."""
+    """Run ff on the IDA main thread under batch mode, with timeout/cancel support.
+
+    Batch mode is entered/left inside _sync_wrapper (on the main thread), not
+    here -- see the batch-mode notes above.
+    """
     # Capture cancel event from thread-local before execute_sync
     cancel_event = get_current_cancel_event()
 
-    old_batch = idc.batch(1)
-    try:
-        timeout = timeout_override
-        if timeout is None:
-            timeout = _get_tool_timeout_seconds()
-        if timeout > 0 or cancel_event is not None:
-            def timed_ff():
-                # Calculate deadline when execution starts on IDA main thread,
-                # not when the request was queued (avoids stale deadlines)
-                deadline = time.monotonic() + timeout if timeout > 0 else None
+    timeout = timeout_override
+    if timeout is None:
+        timeout = _get_tool_timeout_seconds()
+    if timeout > 0 or cancel_event is not None:
+        def timed_ff():
+            # Calculate deadline when execution starts on IDA main thread,
+            # not when the request was queued (avoids stale deadlines)
+            deadline = time.monotonic() + timeout if timeout > 0 else None
 
-                def profilefunc(frame, event, arg):
-                    # Check cancellation first (higher priority)
-                    if cancel_event is not None and cancel_event.is_set():
-                        raise CancelledError("Request was cancelled")
-                    if deadline is not None and time.monotonic() >= deadline:
-                        raise IDASyncError(f"Tool timed out after {timeout:.2f}s")
+            def profilefunc(frame, event, arg):
+                # Check cancellation first (higher priority)
+                if cancel_event is not None and cancel_event.is_set():
+                    raise CancelledError("Request was cancelled")
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise IDASyncError(f"Tool timed out after {timeout:.2f}s")
 
-                old_profile = sys.getprofile()
-                sys.setprofile(profilefunc)
-                try:
-                    return ff()
-                finally:
-                    sys.setprofile(old_profile)
+            old_profile = sys.getprofile()
+            sys.setprofile(profilefunc)
+            try:
+                return ff()
+            finally:
+                sys.setprofile(old_profile)
 
-            timed_ff.__name__ = ff.__name__
-            return _sync_wrapper(timed_ff)
-        return _sync_wrapper(ff)
-    finally:
-        idc.batch(old_batch)
+        timed_ff.__name__ = ff.__name__
+        return _sync_wrapper(timed_ff)
+    return _sync_wrapper(ff)
 
 
 def idasync(f):

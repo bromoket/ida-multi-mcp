@@ -604,6 +604,23 @@ def imports_query(
 
 
 @tool
+def ui_unstick() -> dict:
+    """Force IDA out of a stuck batch mode, restoring all dialogs.
+
+    Symptom this fixes: IDA stops showing ANY modal dialog -- the 'g'
+    jump-to-address box, the script chooser, the save-on-close prompt -- and
+    instead logs an error to the Output window. That means batch mode leaked
+    and is still set from an earlier tool call.
+
+    Deliberately NOT wrapped in @idasync: the whole point is to recover when
+    the main-thread sync path is what got wedged.
+    """
+    from .sync import reset_batch_mode
+
+    return reset_batch_mode()
+
+
+@tool
 @idasync
 def idb_save(
     path: Annotated[str, "Optional destination path (default: current IDB path)"] = "",
