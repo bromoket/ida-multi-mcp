@@ -440,9 +440,9 @@ def test_profile_timeout_never_raises_inside_the_guard_tick(sync_mod):
 
     guard = importlib.import_module(f"{_PKG}.ui_guard")
     frame = types.SimpleNamespace(f_globals={"__name__": guard.__name__})
-    assert sync_mod._guard_is_guard_frame(frame)
+    assert sync_mod.is_guard_frame(frame)
     other = types.SimpleNamespace(f_globals={"__name__": "some.tool.module"})
-    assert not sync_mod._guard_is_guard_frame(other)
+    assert not sync_mod.is_guard_frame(other)
 
 
 def test_sync_errors_reach_the_client_unredacted(sync_mod):

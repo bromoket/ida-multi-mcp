@@ -6,21 +6,22 @@ import queue
 import sys
 import threading
 import time
+import types
 
 import ida_kernwin
 import idaapi
 import idc
 
-from .ui_guard import (
-    begin_tool as _guard_begin_tool,
-    blocking_modal as _guard_blocking_modal,
-    describe as _guard_describe,
-    end_tool as _guard_end_tool,
-    is_guard_frame as _guard_is_guard_frame,
-    is_installed as _guard_is_installed,
-    modal_wait_seconds as _guard_modal_wait_seconds,
-)
 from .rpc import McpToolError
+from .ui_guard import (
+    begin_tool,
+    blocking_modal,
+    describe,
+    end_tool,
+    is_guard_frame,
+    is_installed,
+    modal_wait_seconds,
+)
 from .zeromcp.jsonrpc import RequestCancelledError, get_current_cancel_event
 
 # ============================================================================
@@ -116,7 +117,7 @@ _PENDING, _STARTED, _ABANDONED = "pending", "started", "abandoned"
 
 def _run_with_dialog_scope(ff):
     """Run ff on the main thread with IDA dialogs answered by default."""
-    _guard_begin_tool(ff.__name__)
+    begin_tool(ff.__name__)
     suppress = _suppress_dialogs_enabled()
     previous_batch = None
     if suppress:
@@ -128,7 +129,7 @@ def _run_with_dialog_scope(ff):
             # Restore exactly what was there: headless idalib already runs
             # with batch set and must keep it.
             idc.batch(1 if previous_batch else 0)
-        _guard_end_tool()
+        end_tool()
 
 
 def _await_async_result(res_container, phase, phase_lock, request_id, name, cancel_event):
@@ -137,7 +138,7 @@ def _await_async_result(res_container, phase, phase_lock, request_id, name, canc
     A request that has not started yet can be abandoned: it is marked so that
     runned() skips it, so it never executes after the client saw an error.
     """
-    wait_limit = _guard_modal_wait_seconds()
+    wait_limit = modal_wait_seconds()
 
     def _abandon() -> bool:
         with phase_lock:
@@ -146,7 +147,7 @@ def _await_async_result(res_container, phase, phase_lock, request_id, name, canc
             phase[0] = _ABANDONED
         # Best effort: the phase flag alone already makes runned() a no-op.
         with contextlib.suppress(Exception):
-            ida_kernwin.cancel_exec_request(request_id)
+            _ = ida_kernwin.cancel_exec_request(request_id)
         return True
 
     while True:
@@ -158,7 +159,7 @@ def _await_async_result(res_container, phase, phase_lock, request_id, name, canc
         if cancel_event is not None and cancel_event.is_set() and _abandon():
             raise CancelledError("Request was cancelled before it started")
 
-        blocked = _guard_blocking_modal()
+        blocked = blocking_modal()
         if blocked is None:
             continue
         dialog, age, owner = blocked
@@ -168,7 +169,7 @@ def _await_async_result(res_container, phase, phase_lock, request_id, name, canc
             current = phase[0]
         if current == _PENDING and owner is None and _abandon():
             raise IDASyncError(
-                f"IDA is blocked by a modal dialog {_guard_describe(dialog)}, "
+                f"IDA is blocked by a modal dialog {describe(dialog)}, "
                 f"open for {age:.0f}s. IDA does not run requests while it is "
                 f"shown, so '{name}' was NOT executed. Ask the user to close "
                 f"it, or call ui_dialogs(action='dismiss') if that is "
@@ -177,7 +178,7 @@ def _await_async_result(res_container, phase, phase_lock, request_id, name, canc
         if current == _STARTED and owner == name:
             raise IDASyncError(
                 f"'{name}' is waiting on a dialog it opened: "
-                f"{_guard_describe(dialog)}. It was not auto-dismissed "
+                f"{describe(dialog)}. It was not auto-dismissed "
                 f"(not a plain message box, or IDA_MCP_DIALOG_POLICY=report). "
                 f"Call ui_dialogs(action='dismiss') to let it finish; its "
                 f"result will be discarded."
@@ -227,7 +228,7 @@ def _sync_wrapper(ff, cancel_event=None):
             except queue.Empty:
                 pass
 
-    if _guard_is_installed() and threading.current_thread() is not threading.main_thread():
+    if is_installed() and threading.current_thread() is not threading.main_thread():
         # GUI: queue the request instead of blocking inside execute_sync, so
         # the wait can notice a modal dialog and give up cleanly.
         request_id = idaapi.execute_sync(runned, idaapi.MFF_WRITE | idaapi.MFF_NOWAIT)
@@ -241,7 +242,7 @@ def _sync_wrapper(ff, cancel_event=None):
         raise res
     return res
 
-def _normalize_timeout(value: object) -> float | None:
+def _normalize_timeout(value: float | int | str | None) -> float | None:
     if value is None:
         return None
     try:
@@ -293,7 +294,7 @@ def sync_wrapper(ff, timeout_override: float | None = None):
                 native_timer.daemon = True
                 native_timer.start()
 
-            def profilefunc(frame, event, arg):
+            def profilefunc(frame: types.FrameType, _event: str, _arg: object) -> None:
                 # Check request-level cancellation first (higher priority)
                 if cancel_event is not None and cancel_event.is_set():
                     raise CancelledError("Request was cancelled")
@@ -308,7 +309,7 @@ def sync_wrapper(ff, timeout_override: float | None = None):
                     # The dialog sampler runs nested inside a stuck tool (in
                     # the dialog's event loop); raising there would kill the
                     # sampler, not the tool.
-                    if _guard_is_guard_frame(frame):
+                    if is_guard_frame(frame):
                         return
                     raise IDASyncError(f"Tool timed out after {timeout:.2f}s")
 
@@ -342,7 +343,8 @@ def idasync(f):
     @functools.wraps(f)
     def wrapper(*args, **kwargs):
         ff = functools.partial(f, *args, **kwargs)
-        ff.__name__ = f.__name__
+        # partial has no __name__ of its own; the dispatch path reports it.
+        _ = functools.update_wrapper(ff, f)
         timeout_override = _normalize_timeout(
             getattr(f, "__ida_mcp_timeout_sec__", None)
         )
@@ -384,7 +386,6 @@ def is_window_active():
     else:
         from PyQt5 import QtWidgets
     
-    app = QtWidgets.QApplication.instance()
-    if app is None:
+    if QtWidgets.QApplication.instance() is None:
         return False
-    return app.activeWindow() is not None
+    return QtWidgets.QApplication.activeWindow() is not None
