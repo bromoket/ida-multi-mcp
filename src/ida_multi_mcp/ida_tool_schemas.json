@@ -1,7 +1,7 @@
 [
   {
     "name": "analysis_status",
-    "description": "Check whether IDA's auto-analysis has work outstanding. Non-blocking.\n\n    On a freshly opened binary, analysis runs in the background and the function\n    list, xrefs, strings and decompiler output are all INCOMPLETE until it\n    settles. Check this before drawing conclusions from a first pass, and use\n    analysis_wait() to drive it to completion.\n\n    `queue_empty` is a SNAPSHOT, not a latch. It reports IDA's auto_is_ok() at\n    this instant — \"are the analysis queues empty right now\". IDA re-queues work\n    as it goes, so the value can read True and then False again moments later;\n    observed live on a 23MB DLL. Read it as:\n\n      queue_empty=False -> definitely still working, do not trust results yet\n      queue_empty=True  -> nothing queued at this instant; combine with a stable\n                           function_count across calls before treating analysis\n                           as done\n\n    `finished` is kept as an alias of `queue_empty` for compatibility and\n    carries the same caveat.",
+    "description": "Check whether IDA's auto-analysis has work outstanding. Non-blocking.\n\nOn a freshly opened binary, analysis runs in the background and the function\nlist, xrefs, strings and decompiler output are all INCOMPLETE until it\nsettles. Check this before drawing conclusions from a first pass, and use\nanalysis_wait() to drive it to completion.\n\n`queue_empty` is a SNAPSHOT, not a latch. It reports IDA's auto_is_ok() at\nthis instant — \"are the analysis queues empty right now\". IDA re-queues work\nas it goes, so the value can read True and then False again moments later;\nobserved live on a 23MB DLL. Read it as:\n\n  queue_empty=False -> definitely still working, do not trust results yet\n  queue_empty=True  -> nothing queued at this instant; combine with a stable\n                       function_count across calls before treating analysis\n                       as done\n\n`finished` is kept as an alias of `queue_empty` for compatibility and\ncarries the same caveat.",
     "inputSchema": {
       "type": "object",
       "properties": {},
@@ -13,7 +13,7 @@
   },
   {
     "name": "analysis_step",
-    "description": "Drive IDA's auto-analysis queue for a bounded slice, then return.\n\n    Prefer analysis_wait(), which calls this in a loop with a real timeout.\n\n    IDA's background analysis stalls short of completion: measured on a 23MB\n    DLL it climbed to 73,928 functions on its own and then sat there, never\n    flipping auto_is_ok(). Something has to drain the residual queue.\n\n    Stepping one address at a time keeps each call bounded by max_sec, so the\n    instance stays responsive through the long bulk phase. Once the range is\n    drained this makes one closing auto_wait() call, which is unbounded and is\n    the only thing that actually flips auto_is_ok() — see the comment below.\n    That final slice therefore runs past max_sec.",
+    "description": "Drive IDA's auto-analysis queue for a bounded slice, then return.\n\nPrefer analysis_wait(), which calls this in a loop with a real timeout.\n\nIDA's background analysis stalls short of completion: measured on a 23MB\nDLL it climbed to 73,928 functions on its own and then sat there, never\nflipping auto_is_ok(). Something has to drain the residual queue.\n\nStepping one address at a time keeps each call bounded by max_sec, so the\ninstance stays responsive through the long bulk phase. Once the range is\ndrained this makes one closing auto_wait() call, which is unbounded and is\nthe only thing that actually flips auto_is_ok() — see the comment below.\nThat final slice therefore runs past max_sec.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -30,7 +30,7 @@
   },
   {
     "name": "analyze_batch",
-    "description": "Analyze multiple functions in one call. Selectively include decompilation,\n    disassembly, xrefs, strings, and callees per function. More efficient than\n    calling analyze_function N times — single IDA round-trip.",
+    "description": "Analyze multiple functions in one call. Selectively include decompilation,\ndisassembly, xrefs, strings, and callees per function. More efficient than\ncalling analyze_function N times — single IDA round-trip.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -82,7 +82,7 @@
   },
   {
     "name": "analyze_component",
-    "description": "Analyze related functions as a group: per-function compact summaries,\n    internal call graph (edges only between supplied functions), shared globals,\n    interface vs internal classification, and strings used by multiple members.",
+    "description": "Analyze related functions as a group: per-function compact summaries,\ninternal call graph (edges only between supplied functions), shared globals,\ninterface vs internal classification, and strings used by multiple members.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -254,7 +254,7 @@
   },
   {
     "name": "analyze_function",
-    "description": "Compact single-function analysis: pseudocode (capped at 100 lines), top\n    strings, top non-trivial constants, callers, callees, xrefs, comments, and\n    basic block summary. Use this for \"tell me everything about function X\" in\n    one call instead of chaining decompile + callees + xrefs_to separately.",
+    "description": "Compact single-function analysis: pseudocode (capped at 100 lines), top\nstrings, top non-trivial constants, callers, callees, xrefs, comments, and\nbasic block summary. Use this for \"tell me everything about function X\" in\none call instead of chaining decompile + callees + xrefs_to separately.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -388,7 +388,7 @@
   },
   {
     "name": "append_comments",
-    "description": "Append comments at addresses, deduping exact text by default. Unlike\n    set_comments (which overwrites), this preserves existing annotations — use\n    it for incremental commentary. scope='auto' (default) writes a function\n    comment when addr is a function start, otherwise a line comment; force\n    with scope='func' or 'line'. dedupe=True skips writes when the exact\n    stripped text already appears on its own line.",
+    "description": "Append comments at addresses, deduping exact text by default. Unlike\nset_comments (which overwrites), this preserves existing annotations — use\nit for incremental commentary. scope='auto' (default) writes a function\ncomment when addr is a function start, otherwise a line comment; force\nwith scope='func' or 'line'. dedupe=True skips writes when the exact\nstripped text already appears on its own line.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -524,7 +524,7 @@
   },
   {
     "name": "binary_fingerprint",
-    "description": "Content fingerprint of the loaded binary for similarity index keying.\n\n    Returns the input file's sha256 and md5 (hex, or null if unavailable), the\n    total function count, and an arch label (e.g. 'x86_64'). The sha256 keys the\n    per-binary similarity index so the same binary shares one index across\n    instances; md5 is the fallback when sha256 is unavailable.",
+    "description": "Content fingerprint of the loaded binary for similarity index keying.\n\nReturns the input file's sha256 and md5 (hex, or null if unavailable), the\ntotal function count, and an arch label (e.g. 'x86_64'). The sha256 keys the\nper-binary similarity index so the same binary shares one index across\ninstances; md5 is the fallback when sha256 is unavailable.",
     "inputSchema": {
       "type": "object",
       "properties": {},
@@ -655,7 +655,7 @@
   },
   {
     "name": "classify_functions",
-    "description": "Classify functions as thunk/wrapper/leaf/dispatcher/complex based on\n    size, callee count, and flags. Use '*' (default) for all non-library\n    functions. Returns paginated results sorted by address.",
+    "description": "Classify functions as thunk/wrapper/leaf/dispatcher/complex based on\nsize, callee count, and flags. Use '*' (default) for all non-library\nfunctions. Returns paginated results sorted by address.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -765,7 +765,7 @@
   },
   {
     "name": "declare_type",
-    "description": "Declare C types (structs, unions, enums, typedefs) into the IDB.\n\n    Takes ordinary C declaration text. Declare a type here first, then apply it\n    to an address with set_type.",
+    "description": "Declare C types (structs, unions, enums, typedefs) into the IDB.\n\nTakes ordinary C declaration text. Declare a type here first, then apply it\nto an address with set_type.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -797,7 +797,7 @@
   },
   {
     "name": "decompile",
-    "description": "Decompile one function to Hex-Rays pseudocode.\n\n    The single most useful tool for understanding behaviour. Requires the\n    Hex-Rays decompiler. For many functions at once use decompile_to_file —\n    decompiling in a loop blocks the instance for every other caller.",
+    "description": "Decompile one function to Hex-Rays pseudocode.\n\nThe single most useful tool for understanding behaviour. Requires the\nHex-Rays decompiler. For many functions at once use decompile_to_file —\ndecompiling in a loop blocks the instance for every other caller.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -816,7 +816,7 @@
   },
   {
     "name": "define_code",
-    "description": "Convert raw bytes to a code instruction at each given address. Returns\n    {addr, ea, length} on success (length is the instruction byte length) or\n    {addr, ea, error} if create_insn failed. Use this when IDA classified an\n    instruction as data or failed to decode.",
+    "description": "Convert raw bytes to a code instruction at each given address. Returns\n{addr, ea, length} on success (length is the instruction byte length) or\n{addr, ea, error} if create_insn failed. Use this when IDA classified an\ninstruction as data or failed to decode.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -896,7 +896,7 @@
   },
   {
     "name": "define_func",
-    "description": "Define a function at each given address. IDA infers bounds unless an\n    explicit end address is provided. Returns {addr, start, end} on success or\n    {addr, start, error} if the function already exists or add_func fails.\n    Use this when IDA auto-analysis missed a function entry point.",
+    "description": "Define a function at each given address. IDA infers bounds unless an\nexplicit end address is provided. Returns {addr, start, end} on success or\n{addr, start, error} if the function already exists or add_func fails.\nUse this when IDA auto-analysis missed a function entry point.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1031,7 +1031,7 @@
   },
   {
     "name": "diff_before_after",
-    "description": "Apply a rename/type/comment action and return the before/after decompilation\n    side by side. Actions: 'rename_func' ({name}), 'set_type' ({type}),\n    'set_comment' ({comment}). Useful to verify a rename or type change actually\n    improved readability. Returns {before, after, action_applied, changes_detected}.",
+    "description": "Apply a rename/type/comment action and return the before/after decompilation\nside by side. Actions: 'rename_func' ({name}), 'set_type' ({type}),\n'set_comment' ({comment}). Useful to verify a rename or type change actually\nimproved readability. Returns {before, after, action_applied, changes_detected}.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1124,7 +1124,7 @@
   },
   {
     "name": "enum_upsert",
-    "description": "Create or extend local enums in an idempotent way. Creates the enum if\n    it doesn't exist, then upserts each member: skips if name+value already match,\n    reports conflict if name or value collides with a different entry. Never\n    destructively replaces existing members.",
+    "description": "Create or extend local enums in an idempotent way. Creates the enum if\nit doesn't exist, then upserts each member: skips if name+value already match,\nreports conflict if name or value collides with a different entry. Never\ndestructively replaces existing members.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1156,7 +1156,7 @@
   },
   {
     "name": "export_funcs",
-    "description": "Export function data (addresses, names, sizes, prototypes) in bulk.\n\n    Prefer this over looping a per-function tool — one call instead of N round\n    trips against a single-threaded IDA instance.",
+    "description": "Export function data (addresses, names, sizes, prototypes) in bulk.\n\nPrefer this over looping a per-function tool — one call instead of N round\ntrips against a single-threaded IDA instance.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1310,8 +1310,92 @@
     }
   },
   {
+    "name": "find_xref_signatures",
+    "description": "Find signatures for code locations that reference an address. For each\ninput address, finds all code cross-references TO it, generates a unique\nsignature at each xref site, and returns the shortest ones. Ideal for\ncreating signatures for data addresses, vtable entries, or string\nreferences that can't be signatured directly.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "addrs": {
+          "anyOf": [
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "description": "Address(es) or name(s) to find XREF signatures for (e.g. a data address referenced by code)"
+        },
+        "format": {
+          "type": "string",
+          "description": "Output format: 'ida' (default), 'x64dbg', 'mask', or 'bitmask'"
+        },
+        "top": {
+          "type": "integer",
+          "description": "Number of shortest signatures to return per address (default: 5)"
+        },
+        "max_length": {
+          "type": "integer",
+          "description": "Maximum signature length in bytes (default: 250)"
+        }
+      },
+      "required": [
+        "addrs"
+      ]
+    },
+    "outputSchema": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string"
+          },
+          "addr": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "signatures": {
+            "anyOf": [
+              {
+                "type": "array",
+                "items": {
+                  "type": "object"
+                }
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "total_xrefs": {
+            "type": "integer"
+          },
+          "error": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "query",
+          "addr",
+          "signatures"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  {
     "name": "func_features",
-    "description": "Extract name-independent similarity features for functions, page by page.\n\n    Per function returns: size, is_named, CFG metrics (bb/edge/complexity/loops/\n    callee/caller counts + out-degree sequence), a 64-perm instruction-shingle\n    MinHash, external API (import) callees, referenced strings, non-trivial\n    immediate constants, and — only for named functions — pseudocode identifier\n    tokens. Feed pages into the server-side similarity indexer. Use '*' to iterate\n    all functions; only the page slice is analyzed so large binaries stay bounded.",
+    "description": "Extract name-independent similarity features for functions, page by page.\n\nPer function returns: size, is_named, CFG metrics (bb/edge/complexity/loops/\ncallee/caller counts + out-degree sequence), a 64-perm instruction-shingle\nMinHash, external API (import) callees, referenced strings, non-trivial\nimmediate constants, and — only for named functions — pseudocode identifier\ntokens. Feed pages into the server-side similarity indexer. Use '*' to iterate\nall functions; only the page slice is analyzed so large binaries stay bounded.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1454,7 +1538,7 @@
   },
   {
     "name": "func_profile",
-    "description": "Per-function profile: size, basic block count, cyclomatic complexity,\n    callee/caller counts, and string count. Useful for prioritizing which\n    functions to analyze deeply. Fills the gap between list_funcs (too little\n    info) and analyze_function (too expensive per call).",
+    "description": "Per-function profile: size, basic block count, cyclomatic complexity,\ncallee/caller counts, and string count. Useful for prioritizing which\nfunctions to analyze deeply. Fills the gap between list_funcs (too little\ninfo) and analyze_function (too expensive per call).",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1497,7 +1581,7 @@
   },
   {
     "name": "func_query",
-    "description": "Query functions with richer filtering than list_funcs. Supports regex\n    name filter, size range, type filter, sort by size/name/addr, and pagination.\n    Example: {name_regex: 'crypt', min_size: 100, sort_by: 'size', descending: true}",
+    "description": "Query functions with richer filtering than list_funcs. Supports regex\nname filter, size range, type filter, sort by size/name/addr, and pagination.\nExample: {name_regex: 'crypt', min_size: 100, sort_by: 'size', descending: true}",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1529,7 +1613,7 @@
   },
   {
     "name": "func_tokens",
-    "description": "Emit jTrans-style normalized instruction token streams per function, for a\n    neural BCSD embedding backend. Uses IDA's own operand normalization (registers\n    kept, stack vars -> var_xxx/arg_xxx, imm/disp -> CONST, intra-function jumps ->\n    JUMP_ADDR_<idx>) -- which a byte/objdump reproduction cannot match. Paginated\n    like func_features; returns ``{addr: [token, ...]}``.",
+    "description": "Emit jTrans-style normalized instruction token streams per function, for a\nneural BCSD embedding backend. Uses IDA's own operand normalization (registers\nkept, stack vars -> var_xxx/arg_xxx, imm/disp -> CONST, intra-function jumps ->\nJUMP_ADDR_<idx>) -- which a byte/objdump reproduction cannot match. Paginated\nlike func_features; returns ``{addr: [token, ...]}``.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1564,7 +1648,7 @@
   },
   {
     "name": "get_bytes",
-    "description": "Read raw bytes at one or more addresses.\n\n    Reads the static IDB image, not a live process. Uninitialised BSS reads\n    back as zeroes rather than 0xFF.",
+    "description": "Read raw bytes at one or more addresses.\n\nReads the static IDB image, not a live process. Uninitialised BSS reads\nback as zeroes rather than 0xFF.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1625,7 +1709,7 @@
   },
   {
     "name": "get_global_value",
-    "description": "Read global variable values by address or name\n    (auto-detects hex addresses vs names)",
+    "description": "Read global variable values by address or name\n(auto-detects hex addresses vs names)",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1719,7 +1803,7 @@
   },
   {
     "name": "get_string",
-    "description": "Read NUL-terminated strings at one or more addresses.\n\n    Use when you have a pointer from decompiler output; to search for a string\n    by content use find(type=\"string\") instead.",
+    "description": "Read NUL-terminated strings at one or more addresses.\n\nUse when you have a pointer from decompiler output; to search for a string\nby content use find(type=\"string\") instead.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1751,7 +1835,7 @@
   },
   {
     "name": "idb_save",
-    "description": "Save active IDB to disk, with no dialogs. Call after renaming, retyping,\n    or commenting to persist changes. Optionally specify a custom output path\n    to write a copy instead, leaving the open database untouched.",
+    "description": "Save active IDB to disk, with no dialogs. Call after renaming, retyping,\nor commenting to persist changes. Optionally specify a custom output path\nto write a copy instead, leaving the open database untouched.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1768,7 +1852,7 @@
   },
   {
     "name": "imports",
-    "description": "List imported functions grouped by source module.\n\n    Useful early: the import set is a fast signal of what a binary can do\n    (networking, crypto, process injection) before you decompile anything.",
+    "description": "List imported functions grouped by source module.\n\nUseful early: the import set is a fast signal of what a binary can do\n(networking, crypto, process injection) before you decompile anything.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1792,7 +1876,7 @@
   },
   {
     "name": "imports_query",
-    "description": "Query imports with module and name filters. Example:\n    {module: 'kernel32', filter: '*File*'} to find all kernel32 file I/O imports.",
+    "description": "Query imports with module and name filters. Example:\n{module: 'kernel32', filter: '*File*'} to find all kernel32 file I/O imports.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1824,7 +1908,7 @@
   },
   {
     "name": "infer_types",
-    "description": "Infer the type of data or a function at an address.\n\n    Asks Hex-Rays first and falls back to IDA's own guess. Returns the inferred\n    type plus a confidence label; a null type means neither could decide.",
+    "description": "Infer the type of data or a function at an address.\n\nAsks Hex-Rays first and falls back to IDA's own guess. Returns the inferred\ntype plus a confidence label; a null type means neither could decide.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1856,7 +1940,7 @@
   },
   {
     "name": "insn_query",
-    "description": "Search instructions by mnemonic and/or operand values within a function,\n    segment, or global scope. Uses existing scan infrastructure.\n    Example: {mnem: 'call', func: '0x401000'} or {mnem: 'syscall'}",
+    "description": "Search instructions by mnemonic and/or operand values within a function,\nsegment, or global scope. Uses existing scan infrastructure.\nExample: {mnem: 'call', func: '0x401000'} or {mnem: 'syscall'}",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1888,7 +1972,7 @@
   },
   {
     "name": "int_convert",
-    "description": "Convert numbers between hex, decimal, binary and ASCII, in batch.\n\n    Pure computation — no IDB access, so it needs no instance state.",
+    "description": "Convert numbers between hex, decimal, binary and ASCII, in batch.\n\nPure computation — no IDB access, so it needs no instance state.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1944,7 +2028,7 @@
   },
   {
     "name": "list_funcs",
-    "description": "List functions in the binary, paginated.\n\n    Requires auto-analysis to be finished — call analysis_wait() first on a\n    freshly opened binary or this returns a partial list. On large binaries use\n    count/offset rather than fetching everything; count=0 with a glob filter is\n    a full scan.",
+    "description": "List functions in the binary, paginated.\n\nRequires auto-analysis to be finished — call analysis_wait() first on a\nfreshly opened binary or this returns a partial list. On large binaries use\ncount/offset rather than fetching everything; count=0 with a glob filter is\na full scan.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -2011,7 +2095,7 @@
   },
   {
     "name": "list_globals",
-    "description": "List global variables (non-function named addresses), paginated.\n\n    Requires auto-analysis to be finished — call analysis_wait() first on a\n    freshly opened binary or names will still be missing.",
+    "description": "List global variables (non-function named addresses), paginated.\n\nRequires auto-analysis to be finished — call analysis_wait() first on a\nfreshly opened binary or names will still be missing.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -2078,7 +2162,7 @@
   },
   {
     "name": "lookup_funcs",
-    "description": "Resolve functions by address or by name; the form is auto-detected.\n\n    Accepts 0x-prefixed addresses, sub_XXXX names, or real symbol names. Use\n    this to turn a name from decompiler output into an address to work with.",
+    "description": "Resolve functions by address or by name; the form is auto-detected.\n\nAccepts 0x-prefixed addresses, sub_XXXX names, or real symbol names. Use\nthis to turn a name from decompiler output into an address to work with.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -2106,6 +2190,257 @@
       "items": {
         "type": "object"
       }
+    }
+  },
+  {
+    "name": "make_signature",
+    "description": "Create unique byte signatures for addresses. Generates the shortest\nunique signature starting at each address by walking instructions and\nwildcarding operands. Useful for finding stable patterns that survive\nrecompilation.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "addrs": {
+          "anyOf": [
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "description": "Address(es) or name(s) to create unique signatures for (e.g. '0x401000', 'main', or ['0x401000', 'sub_402000'])"
+        },
+        "format": {
+          "type": "string",
+          "description": "Output format: 'ida' (default), 'x64dbg', 'mask', or 'bitmask'"
+        },
+        "wildcard_operands": {
+          "type": "boolean",
+          "description": "Wildcard instruction operands for relocatable signatures (default: true)"
+        },
+        "max_length": {
+          "type": "integer",
+          "description": "Maximum signature length in bytes before giving up (default: 1000)"
+        }
+      },
+      "required": [
+        "addrs"
+      ]
+    },
+    "outputSchema": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string"
+          },
+          "addr": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "signature": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "format": {
+            "type": "string"
+          },
+          "unique": {
+            "type": "boolean"
+          },
+          "error": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "query",
+          "addr",
+          "signature",
+          "format"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  {
+    "name": "make_signature_for_function",
+    "description": "Create unique byte signatures for function entry points. Resolves each\nname/address to a function, then generates the shortest unique signature\nstarting at the function start.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "addrs": {
+          "anyOf": [
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "description": "Function address(es) or name(s) to create signatures for (e.g. 'main', '0x401000', or ['main', 'sub_402000'])"
+        },
+        "format": {
+          "type": "string",
+          "description": "Output format: 'ida' (default), 'x64dbg', 'mask', or 'bitmask'"
+        },
+        "wildcard_operands": {
+          "type": "boolean",
+          "description": "Wildcard instruction operands for relocatable signatures (default: true)"
+        },
+        "max_length": {
+          "type": "integer",
+          "description": "Maximum signature length in bytes before giving up (default: 1000)"
+        }
+      },
+      "required": [
+        "addrs"
+      ]
+    },
+    "outputSchema": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string"
+          },
+          "addr": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "signature": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "format": {
+            "type": "string"
+          },
+          "error": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "query",
+          "addr",
+          "name",
+          "signature",
+          "format"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  {
+    "name": "make_signature_for_range",
+    "description": "Create a byte signature for a specific address range (e.g. a selected\nregion). Unlike make_signature, this does NOT guarantee uniqueness — it\nsimply encodes the bytes in the range with optional operand wildcarding.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "start": {
+          "type": "string",
+          "description": "Start address or name (e.g. '0x401000')"
+        },
+        "end": {
+          "type": "string",
+          "description": "End address or name (exclusive, e.g. '0x401020')"
+        },
+        "format": {
+          "type": "string",
+          "description": "Output format: 'ida' (default), 'x64dbg', 'mask', or 'bitmask'"
+        },
+        "wildcard_operands": {
+          "type": "boolean",
+          "description": "Wildcard instruction operands for relocatable signatures (default: true)"
+        }
+      },
+      "required": [
+        "start",
+        "end"
+      ]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string"
+        },
+        "addr": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "signature": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "format": {
+          "type": "string"
+        },
+        "unique": {
+          "type": "boolean"
+        },
+        "error": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "query",
+        "addr",
+        "signature",
+        "format"
+      ],
+      "additionalProperties": false
     }
   },
   {
@@ -2304,7 +2639,7 @@
   },
   {
     "name": "py_eval",
-    "description": "Execute Python code in IDA context.\n    Returns dict with result/stdout/stderr.\n    Has access to all IDA API modules.\n    Supports Jupyter-style evaluation.",
+    "description": "Execute Python code in IDA context.\nReturns dict with result/stdout/stderr.\nHas access to all IDA API modules.\nSupports Jupyter-style evaluation.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -2323,7 +2658,7 @@
   },
   {
     "name": "read_struct",
-    "description": "Reads struct type definition and parses actual memory values at the\n    given address as instances of that struct type.\n\n    If struct name is not provided, attempts to auto-detect from address.\n    Auto-detection only works if IDA already has type information applied\n    at that address\n\n    Returns struct layout with actual memory values for each field.",
+    "description": "Reads struct type definition and parses actual memory values at the\ngiven address as instances of that struct type.\n\nIf struct name is not provided, attempts to auto-detect from address.\nAuto-detection only works if IDA already has type information applied\nat that address\n\nReturns struct layout with actual memory values for each field.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -2620,7 +2955,7 @@
   },
   {
     "name": "search_structs",
-    "description": "Find structures whose name contains a substring (case-insensitive).\n\n    Returns name, size and field count. Use read_struct to see the fields or to\n    overlay the struct on an address.",
+    "description": "Find structures whose name contains a substring (case-insensitive).\n\nReturns name, size and field count. Use read_struct to see the fields or to\noverlay the struct on an address.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -2642,7 +2977,7 @@
   },
   {
     "name": "server_health",
-    "description": "Health/ready probe for MCP server and current IDB state. Returns\n    uptime, IDB path, auto-analysis status, Hex-Rays availability, and\n    strings cache state.",
+    "description": "Health/ready probe for MCP server and current IDB state. Returns\nuptime, IDB path, auto-analysis status, Hex-Rays availability, and\nstrings cache state.",
     "inputSchema": {
       "type": "object",
       "properties": {},
@@ -2654,7 +2989,7 @@
   },
   {
     "name": "server_warmup",
-    "description": "Warm up IDA subsystems to reduce first-call latency. Call after\n    connecting to a new instance to ensure analysis is complete and caches\n    are populated before running tools.",
+    "description": "Warm up IDA subsystems to reduce first-call latency. Call after\nconnecting to a new instance to ensure analysis is complete and caches\nare populated before running tools.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -2821,7 +3156,7 @@
   },
   {
     "name": "stack_frame",
-    "description": "List the stack frame variables of one or more functions.\n\n    Returns each local's name, offset, size and type — the frame layout behind\n    the var_NN names in decompiler output.",
+    "description": "List the stack frame variables of one or more functions.\n\nReturns each local's name, offset, size and type — the frame layout behind\nthe var_NN names in decompiler output.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -2852,8 +3187,287 @@
     }
   },
   {
+    "name": "struct_member_upsert",
+    "description": "Upsert struct members by offset (gap-fill, retype, rename) idempotently.\n\nFills a reverse-engineered struct in incrementally without rewriting the\nwhole declaration. Existing members never shift. Replacing a *named* member\nrequires old_type as a guard so concurrent work is not silently clobbered;\ngaps need no guard. Use dry_run to validate a batch first.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "queries": {
+          "anyOf": [
+            {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "struct": {
+                    "type": "string",
+                    "description": "Struct type name"
+                  },
+                  "members": {
+                    "anyOf": [
+                      {
+                        "type": "array",
+                        "items": {
+                          "type": "object",
+                          "properties": {
+                            "offset": {
+                              "anyOf": [
+                                {
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "integer"
+                                }
+                              ],
+                              "description": "Byte offset of the member within the struct (hex or int)"
+                            },
+                            "name": {
+                              "type": "string",
+                              "description": "New member name"
+                            },
+                            "old_type": {
+                              "type": "string",
+                              "description": "Type or member name that must currently cover the offset. Required when the target is a named member (guards against clobbering work); optional when the target is a gap."
+                            },
+                            "size": {
+                              "type": "integer",
+                              "description": "Integer member size: 1/2/4/8 -> uint8/16/32/64 (use size OR type)"
+                            },
+                            "type": {
+                              "type": "string",
+                              "description": "C type name or declaration for the new member (use size OR type)"
+                            }
+                          },
+                          "required": [],
+                          "additionalProperties": false
+                        }
+                      },
+                      {
+                        "type": "object",
+                        "properties": {
+                          "offset": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "integer"
+                              }
+                            ],
+                            "description": "Byte offset of the member within the struct (hex or int)"
+                          },
+                          "name": {
+                            "type": "string",
+                            "description": "New member name"
+                          },
+                          "old_type": {
+                            "type": "string",
+                            "description": "Type or member name that must currently cover the offset. Required when the target is a named member (guards against clobbering work); optional when the target is a gap."
+                          },
+                          "size": {
+                            "type": "integer",
+                            "description": "Integer member size: 1/2/4/8 -> uint8/16/32/64 (use size OR type)"
+                          },
+                          "type": {
+                            "type": "string",
+                            "description": "C type name or declaration for the new member (use size OR type)"
+                          }
+                        },
+                        "required": [],
+                        "additionalProperties": false
+                      }
+                    ],
+                    "description": "Members to upsert"
+                  },
+                  "dry_run": {
+                    "type": "boolean",
+                    "description": "Validate only (check offsets/old_type/new type); no changes"
+                  }
+                },
+                "required": [],
+                "additionalProperties": false
+              }
+            },
+            {
+              "type": "object",
+              "properties": {
+                "struct": {
+                  "type": "string",
+                  "description": "Struct type name"
+                },
+                "members": {
+                  "anyOf": [
+                    {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "offset": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "integer"
+                              }
+                            ],
+                            "description": "Byte offset of the member within the struct (hex or int)"
+                          },
+                          "name": {
+                            "type": "string",
+                            "description": "New member name"
+                          },
+                          "old_type": {
+                            "type": "string",
+                            "description": "Type or member name that must currently cover the offset. Required when the target is a named member (guards against clobbering work); optional when the target is a gap."
+                          },
+                          "size": {
+                            "type": "integer",
+                            "description": "Integer member size: 1/2/4/8 -> uint8/16/32/64 (use size OR type)"
+                          },
+                          "type": {
+                            "type": "string",
+                            "description": "C type name or declaration for the new member (use size OR type)"
+                          }
+                        },
+                        "required": [],
+                        "additionalProperties": false
+                      }
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "offset": {
+                          "anyOf": [
+                            {
+                              "type": "string"
+                            },
+                            {
+                              "type": "integer"
+                            }
+                          ],
+                          "description": "Byte offset of the member within the struct (hex or int)"
+                        },
+                        "name": {
+                          "type": "string",
+                          "description": "New member name"
+                        },
+                        "old_type": {
+                          "type": "string",
+                          "description": "Type or member name that must currently cover the offset. Required when the target is a named member (guards against clobbering work); optional when the target is a gap."
+                        },
+                        "size": {
+                          "type": "integer",
+                          "description": "Integer member size: 1/2/4/8 -> uint8/16/32/64 (use size OR type)"
+                        },
+                        "type": {
+                          "type": "string",
+                          "description": "C type name or declaration for the new member (use size OR type)"
+                        }
+                      },
+                      "required": [],
+                      "additionalProperties": false
+                    }
+                  ],
+                  "description": "Members to upsert"
+                },
+                "dry_run": {
+                  "type": "boolean",
+                  "description": "Validate only (check offsets/old_type/new type); no changes"
+                }
+              },
+              "required": [],
+              "additionalProperties": false
+            }
+          ],
+          "description": "Replace gap/placeholder or named struct members by offset without shifting layout"
+        }
+      },
+      "required": [
+        "queries"
+      ]
+    },
+    "outputSchema": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "struct": {
+            "type": "string"
+          },
+          "dry_run": {
+            "type": "boolean"
+          },
+          "members": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "offset": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "old": {
+                  "type": "string"
+                },
+                "ty": {
+                  "type": "string"
+                },
+                "created": {
+                  "type": "boolean"
+                },
+                "replaced": {
+                  "type": "boolean"
+                },
+                "skipped": {
+                  "type": "boolean"
+                },
+                "error": {
+                  "type": "string"
+                }
+              },
+              "required": [],
+              "additionalProperties": false
+            }
+          },
+          "summary": {
+            "type": "object",
+            "properties": {
+              "created": {
+                "type": "integer"
+              },
+              "replaced": {
+                "type": "integer"
+              },
+              "skipped": {
+                "type": "integer"
+              },
+              "conflicts": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "created",
+              "replaced",
+              "skipped",
+              "conflicts"
+            ],
+            "additionalProperties": false
+          },
+          "error": {
+            "type": "string"
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      }
+    }
+  },
+  {
     "name": "survey_binary",
-    "description": "Get a compact overview of the binary in one call. Returns file metadata,\n    segment layout, entry points, statistics, top 15 strings and functions ranked\n    by xref count (functions include classification: thunk/wrapper/leaf/dispatcher/\n    complex), imports by category, and call graph summary. Use this as your FIRST\n    tool call when starting analysis. Do not call list_funcs, imports, or find_regex\n    separately for triage — this returns all of that. Use detail_level='minimal'\n    for binaries with >10k functions.",
+    "description": "Get a compact overview of the binary in one call. Returns file metadata,\nsegment layout, entry points, statistics, top 15 strings and functions ranked\nby xref count (functions include classification: thunk/wrapper/leaf/dispatcher/\ncomplex), imports by category, and call graph summary. Use this as your FIRST\ntool call when starting analysis. Do not call list_funcs, imports, or find_regex\nseparately for triage — this returns all of that. Use detail_level='minimal'\nfor binaries with >10k functions.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -3236,7 +3850,7 @@
   },
   {
     "name": "trace_data_flow",
-    "description": "Follow cross-references from or to an address, automatically traversing\n    multiple hops. 'forward' follows xrefs-from, 'backward' follows xrefs-to.\n    Returns nodes (with function name, instruction, code/data classification) and\n    edges. Do not use for call graph traversal — use callgraph for that.",
+    "description": "Follow cross-references from or to an address, automatically traversing\nmultiple hops. 'forward' follows xrefs-from, 'backward' follows xrefs-to.\nReturns nodes (with function name, instruction, code/data classification) and\nedges. Do not use for call graph traversal — use callgraph for that.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -3357,8 +3971,28 @@
     }
   },
   {
+    "name": "ui_dialogs",
+    "description": "Inspect or clear a modal dialog that blocks IDA (GUI only).\n\nIDA runs no tool while a modal dialog is open, so other tools fail with\n'IDA is blocked by a modal dialog'. Call this with action='list' to see\nwhich dialog it is. Only dismiss or accept a dialog that your own call\nopened, or when the user asked you to; a dialog the user opened may hold\ntheir unsaved input. Message boxes raised by a tool are already\nauto-dismissed, and listed under recently_dismissed.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "description": "list|dismiss|accept|unstick. list (default): report the open modal dialog, if any. dismiss: close it as if Escape/Cancel was pressed. accept: press its default button. unstick: clear a stuck cancellation flag and a leaked batch mode."
+        }
+      },
+      "required": []
+    },
+    "outputSchema": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object"
+      }
+    }
+  },
+  {
     "name": "undefine",
-    "description": "Undefine item(s) at each address, converting them back to raw bytes.\n    Size is determined from `end` (exclusive) or `size`; defaults to 1 byte.\n    Uses ida_bytes.DELIT_EXPAND so adjacent items spanning into the range are\n    fully removed. Returns {addr, start, size} on success.",
+    "description": "Undefine item(s) at each address, converting them back to raw bytes.\nSize is determined from `end` (exclusive) or `size`; defaults to 1 byte.\nUses ida_bytes.DELIT_EXPAND so adjacent items spanning into the range are\nfully removed. Returns {addr, start, size} on success.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -3446,7 +4080,7 @@
   },
   {
     "name": "xref_query",
-    "description": "Query cross-references with direction and type filters.\n    direction='to' finds refs TO addr, 'from' finds refs FROM addr, 'both' finds all.\n    type_filter='code' shows only code xrefs, 'data' only data, 'all' shows both.\n    Supports dedup and pagination.",
+    "description": "Query cross-references with direction and type filters.\ndirection='to' finds refs TO addr, 'from' finds refs FROM addr, 'both' finds all.\ntype_filter='code' shows only code xrefs, 'data' only data, 'all' shows both.\nSupports dedup and pagination.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -3478,7 +4112,7 @@
   },
   {
     "name": "xrefs_from",
-    "description": "Get cross-references from specified addresses (symmetric with xrefs_to).\n    Returns outgoing code and data references for each address.",
+    "description": "Get cross-references from specified addresses (symmetric with xrefs_to).\nReturns outgoing code and data references for each address.",
     "inputSchema": {
       "type": "object",
       "properties": {
