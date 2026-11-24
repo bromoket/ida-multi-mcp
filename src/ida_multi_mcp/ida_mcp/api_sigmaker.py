@@ -7,7 +7,7 @@ This module integrates sigmaker.py functionality to provide:
 - Multiple output formats: IDA, x64dbg, mask, bitmask
 """
 
-from typing import Annotated, Any, NotRequired, TypedDict
+from typing import Annotated, NotRequired, TypedDict
 
 import ida_funcs
 import idaapi
@@ -99,7 +99,10 @@ class MakeSigForFunctionResult(TypedDict):
 class XrefSigResult(TypedDict):
     query: str
     addr: str | None
-    signatures: list[dict[str, Any]] | None
+    # Bare dict on purpose: zeromcp renders dict[str, Any] as
+    # additionalProperties: object, which declares every value an object and
+    # would make schema-validating clients reject these string/int entries.
+    signatures: list[dict] | None  # pyright: ignore[reportMissingTypeArgument]
     total_xrefs: NotRequired[int]
     error: NotRequired[str]
 
