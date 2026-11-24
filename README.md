@@ -59,8 +59,36 @@ Cherry-picked [ida-pro-mcp#446](https://github.com/mrexodia/ida-pro-mcp/issues/4
 in the GUI, saving no longer `DBFL_KILL`s the live loose working files (which corrupts
 the DB on reopen); only headless idalib packs into a single compressed file.
 
-Everything above was verified against a live IDA 9.3 instance; the router / registry /
-instance-routing / idalib layer is untouched.
+### Fixed — modal dialogs no longer wedge the server
+A modal dialog used to stall **every** MCP call until someone clicked it away, past the
+tool timeout. Two cases, handled differently:
+
+- **Raised by a tool** (`warning()`, `ask_yn()`, SDK prompts): IDA's batch mode is set
+  and restored on the main thread around the tool's own run, so the prompt is answered
+  with its default instead of shown, as in headless IDA. No user dialog can be
+  auto-answered: nothing else runs on the main thread meanwhile. Message boxes that
+  still appear are auto-dismissed and logged.
+- **Opened by you or by IDA** (Jump, Options, ...): IDA defers every request while it is
+  open. Calls now fail after a few seconds with *"IDA is blocked by a modal dialog
+  'Jump!' ... NOT executed"* instead of hanging, and the abandoned request never runs
+  late. Your dialog is never touched automatically.
+
+New tool **`ui_dialogs`** (`list` / `dismiss` / `accept` / `unstick`) works even while IDA
+is blocked. Knobs: `IDA_MCP_SUPPRESS_DIALOGS=0` (keep interactive prompts during tools),
+`IDA_MCP_DIALOG_POLICY=report` (never auto-dismiss), `IDA_MCP_MODAL_WAIT_SEC` (default 3).
+
+### Fixed — IDA no longer dies when a client gives up
+On Linux/macOS, if an MCP client timed out or cancelled while a tool was still running,
+the late reply hit a closed socket and `SIGPIPE` killed IDA outright: no save, no log.
+The plugin now ignores `SIGPIPE`. The router also stopped printing a cleanup line onto
+the stdio JSON-RPC stream after an IDA crash.
+
+### Added — `struct_member_upsert`
+Offset-addressed struct editing (fill a hole or `gapNN`, retype a member in place without
+shifting neighbours), ported from ida-pro-mcp PR #473 with two guard bugs fixed.
+
+Verified live on IDA 9.5 (GUI and headless idalib); the fork tracks
+[MeroZemory/ida-multi-mcp](https://github.com/MeroZemory/ida-multi-mcp) `main`.
 
 ## Quick start
 
@@ -70,6 +98,9 @@ Install into the **same Python IDA uses**, then (re)start IDA:
 git clone https://github.com/bromoket/ida-multi-mcp
 cd ida-multi-mcp
 python -m pip install --force-reinstall --no-deps .
+# Python without pip (e.g. Arch's python3.13): uv into the user site instead
+uv pip install --python python3.13 --prefix ~/.local --break-system-packages --no-deps --reinstall .
+ida-multi-mcp --verify   # checks the installed IDA plugin loader matches the package
 ```
 
 Full install/registration steps (IDA plugin placement, MCP client config) live in
