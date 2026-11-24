@@ -14,6 +14,8 @@ member must be refused rather than silently clobbering the next field, and
 dry_run must not mutate.
 """
 
+from typing import Any
+
 from ..framework import (
     test,
     skip_test,
@@ -52,8 +54,34 @@ def _reset_struct(name: str, body: str) -> None:
         skip_test(f"failed to declare {name}: {result[0]['error']}")
 
 
-def _members_by_name(struct_name: str) -> dict:
-    info = type_inspect({"name": struct_name, "include_members": True})[0]
+def _inspect_struct(struct_name: str) -> dict[str, Any]:
+    """Read a struct straight from the type system.
+
+    Deliberately independent of the tool under test: the upstream PR this was
+    ported from used a ``type_inspect`` tool this fork does not have.
+    """
+    import ida_typeinf
+
+    tif = ida_typeinf.tinfo_t()
+    if not tif.get_named_type(None, struct_name) or not tif.is_udt():
+        return {"name": struct_name, "exists": False}
+    udt = ida_typeinf.udt_type_data_t()
+    if not tif.get_udt_details(udt):
+        return {"name": struct_name, "exists": False}
+    members = [
+        {
+            "name": udm.name,
+            "offset": hex(udm.offset // 8),
+            "size": udm.size // 8,
+            "type": str(udm.type),
+        }
+        for udm in udt
+    ]
+    return {"name": struct_name, "exists": True, "size": tif.get_size(), "members": members}
+
+
+def _members_by_name(struct_name: str) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+    info = _inspect_struct(struct_name)
     assert info.get("exists") is True
     return info, {m["name"]: m for m in (info.get("members") or [])}
 
@@ -243,40 +271,3 @@ def test_struct_member_upsert_struct_not_found():
     )
     assert_is_list(res, min_length=1)
     assert_error(res[0], contains="not found")
-class StructFieldUpsert(TypedDict):
-    """Single struct member replace/insert operation.
-
-    Targets the member currently covering `offset` (a gap or a named field) and
-    replaces it with a new member. Provide exactly one of `size` or `type`.
-    """
-
-    offset: Annotated[str | int, "Byte offset of the member within the struct (hex or int)"]
-    name: Annotated[str, "New member name"]
-    old_type: NotRequired[
-        Annotated[
-            str,
-            "Type or member name that must currently cover the offset. Required when "
-            "the target is a named member (guards against clobbering); optional when "
-            "the target is a gap.",
-        ]
-    ]
-    size: NotRequired[
-        Annotated[int, "Integer member size: 1/2/4/8 -> uint8/16/32/64 (use size OR type)"]
-    ]
-    type: NotRequired[
-        Annotated[str, "C type name or declaration for the new member (use size OR type)"]
-    ]
-
-
-class StructMemberUpsert(TypedDict):
-    """Upsert struct members by offset without shifting existing fields."""
-
-    struct: Annotated[str, "Struct type name"]
-    members: Annotated[
-        list[StructFieldUpsert] | StructFieldUpsert, "Members to upsert"
-    ]
-    dry_run: NotRequired[
-        Annotated[bool, "Validate only (check offsets/old_type/new type); no changes"]
-    ]
-
-
