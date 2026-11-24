@@ -7,17 +7,15 @@ This module integrates sigmaker.py functionality to provide:
 - Multiple output formats: IDA, x64dbg, mask, bitmask
 """
 
-from typing import Annotated, NotRequired, TypedDict
+from typing import Annotated, Any, NotRequired, TypedDict
 
-import idaapi
 import ida_funcs
-
-from .rpc import tool
-from .sync import idasync, tool_timeout
-from .utils import parse_address, normalize_list_input
+import idaapi
 
 from . import _sigmaker as _sm
-
+from .rpc import tool
+from .sync import IDAError, idasync, tool_timeout
+from .utils import normalize_list_input, parse_address
 
 # ---------------------------------------------------------------------------
 # Output format helpers
@@ -34,7 +32,9 @@ _FORMAT_ALIASES = {
 def _resolve_format(fmt: str) -> "str":
     key = fmt.lower().strip()
     if key not in _FORMAT_ALIASES:
-        raise ValueError(
+        # IDAError, not ValueError: plain exceptions reach the client redacted
+        # as "Internal Error: ValueError", hiding the list of valid formats.
+        raise IDAError(
             f"Unknown signature format '{fmt}'. "
             f"Valid formats: ida, x64dbg, mask, bitmask"
         )
@@ -46,7 +46,7 @@ def _make_config(
     wildcard_operands: bool = True,
     continue_outside_function: bool = True,
     max_length: int = 1000,
-) -> "object":
+) -> "_sm.SigMakerConfig":
     return _sm.SigMakerConfig(
         output_format=_sm.SignatureType(fmt),
         wildcard_operands=wildcard_operands,
@@ -99,7 +99,7 @@ class MakeSigForFunctionResult(TypedDict):
 class XrefSigResult(TypedDict):
     query: str
     addr: str | None
-    signatures: list[dict] | None
+    signatures: list[dict[str, Any]] | None
     total_xrefs: NotRequired[int]
     error: NotRequired[str]
 
@@ -143,6 +143,9 @@ def make_signature(
 
     results: list[MakeSigResult] = []
     for addr_str in addrs_list:
+        # Reset per item: a stale ea from the previous item was reported as the
+        # address of an item that failed to resolve.
+        ea: int | None = None
         try:
             ea = _resolve_addr(addr_str)
             result = maker.make_signature(ea, cfg)
@@ -159,7 +162,7 @@ def make_signature(
         except Exception as e:
             results.append({
                 "query": addr_str,
-                "addr": hex(ea) if 'ea' in dir() else None,
+                "addr": hex(ea) if ea is not None else None,
                 "signature": None,
                 "format": format,
                 "error": str(e),
