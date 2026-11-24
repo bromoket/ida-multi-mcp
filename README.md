@@ -87,8 +87,28 @@ the stdio JSON-RPC stream after an IDA crash.
 Offset-addressed struct editing (fill a hole or `gapNN`, retype a member in place without
 shifting neighbours), ported from ida-pro-mcp PR #473 with two guard bugs fixed.
 
-Verified live on IDA 9.5 (GUI and headless idalib); the fork tracks
-[MeroZemory/ida-multi-mcp](https://github.com/MeroZemory/ida-multi-mcp) `main`.
+### Fixed — tools that returned wrong answers
+Found by calling every tool live with valid and edge-case arguments:
+
+- `insn_query` failed on every call; operand filters now accept `"0x10"` strings.
+- `func_query` with an invalid regex returned every function; `find(type=immediate)` searched
+  for `0` when given a non-number. Both now report the bad argument.
+- `get_bytes` returned `0xff` filler for unmapped addresses and `patch`/`put_int` reported
+  success there; both now say the address is not mapped.
+- `export_funcs(format=c_header)` declarations now include the function name.
+- `declare_stack` accepts negative (frame-pointer relative) offsets, so locals can be declared.
+- Unknown options (`xref_query` direction, `export_funcs` format) are rejected instead of
+  silently returning nothing.
+- Tool `outputSchema`s no longer declare `Any`-typed values objects, which made schema-validating
+  clients reject valid results (`analyze_function`, `ui_dialogs`).
+
+### Upstream
+The fork tracks [MeroZemory/ida-multi-mcp](https://github.com/MeroZemory/ida-multi-mcp) `main`.
+Sigmaker and `struct_member_upsert` are fork-only, and upstream already has its own GUI-safe
+`idb_save`. Everything else above is proposed upstream as
+[#46](https://github.com/MeroZemory/ida-multi-mcp/pull/46)–[#52](https://github.com/MeroZemory/ida-multi-mcp/pull/52).
+
+Verified live on IDA 9.5 (GUI and headless idalib).
 
 ## Quick start
 
