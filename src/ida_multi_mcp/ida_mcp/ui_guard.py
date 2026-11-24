@@ -38,6 +38,7 @@ import os
 import queue
 import threading
 import time
+import types
 from typing import Any
 
 _POLICY_ENV = "IDA_MCP_DIALOG_POLICY"
@@ -372,7 +373,7 @@ def install() -> bool:
     return True
 
 
-def is_guard_frame(frame) -> bool:
+def is_guard_frame(frame: types.FrameType) -> bool:
     """True for frames of this module, so sync.py's timeout profiler never
     raises inside the sampler tick (it runs nested inside a stuck tool)."""
     return frame.f_globals.get("__name__") == __name__
