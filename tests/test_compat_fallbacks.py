@@ -6,7 +6,7 @@ stubs that present or withhold the specific attributes each wrapper probes.
 """
 
 import sys
-import types
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -14,7 +14,12 @@ import pytest
 _PKG = "ida_multi_mcp.ida_mcp"
 _ABSENT = object()
 
-_IDA_MODULES = ["idaapi", "ida_funcs", "ida_nalt", "ida_typeinf",
+
+def _mod(name: str) -> Any:
+    """A stubbed IDA module. Any: stubs take attributes the real SDK lacks."""
+    return sys.modules[name]
+
+_IDA_MODULES = ["idaapi", "ida_bytes", "ida_funcs", "ida_nalt", "ida_typeinf",
                 "ida_ida", "ida_hexrays", "ida_entry", "idc", "idautils"]
 
 
@@ -53,6 +58,7 @@ def _load_compat(saved, *, kernel_version="9.3", present=(), absent=()):
 
     path = pathlib.Path(__file__).resolve().parents[1] / "src" / "ida_multi_mcp" / "ida_mcp" / "compat.py"
     spec = importlib.util.spec_from_file_location(f"{_PKG}.compat", path)
+    assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
@@ -172,8 +178,8 @@ def test_missing_required_apis_flags_ida_90_sp0(load):
         kernel_version="9.0",
         absent=("ida_typeinf.tinfo_t",),
     )
-    sys.modules["ida_typeinf"].tinfo_t = lambda: MagicMock(spec=[])
-    sys.modules["ida_funcs"].func_t = lambda: MagicMock(spec=[])
+    _mod("ida_typeinf").tinfo_t = lambda: MagicMock(spec=[])
+    _mod("ida_funcs").func_t = lambda: MagicMock(spec=[])
     missing = compat.missing_required_apis()
     assert set(missing) == {"func_t.get_name", "func_t.get_prototype", "tinfo_t.get_udm"}
     with pytest.raises(RuntimeError, match="9.0 SP1"):
@@ -183,8 +189,8 @@ def test_missing_required_apis_flags_ida_90_sp0(load):
 def test_missing_required_apis_silent_on_old_ida(load):
     """Pre-9.0 legitimately lacks these; the fallbacks cover it, so stay quiet."""
     compat = load(kernel_version="8.3")
-    sys.modules["ida_funcs"].func_t = lambda: MagicMock(spec=[])
-    sys.modules["ida_typeinf"].tinfo_t = lambda: MagicMock(spec=[])
+    _mod("ida_funcs").func_t = lambda: MagicMock(spec=[])
+    _mod("ida_typeinf").tinfo_t = lambda: MagicMock(spec=[])
     assert compat.missing_required_apis() == []
     compat.assert_supported_ida()
 
@@ -193,3 +199,68 @@ def test_missing_required_apis_silent_on_healthy_ida(load):
     compat = load(kernel_version="9.3")
     assert compat.missing_required_apis() == []
     compat.assert_supported_ida()
+
+
+# ---------------------------------------------------------------------------
+# Binary search: ida_bytes.bin_search drifted in IDA 9.0
+# ---------------------------------------------------------------------------
+# Verified live on IDA 9.5: bin_search(start, end, compiled_vec, flags) returns
+# a tuple (ea, index), and the raw (bytes, mask, len, flags) overload raises
+# TypeError ("Wrong number or type of arguments"). find_bytes is the 9.x API.
+
+
+def test_find_bytes_masked_uses_find_bytes_on_9x(load):
+    compat = load(kernel_version="9.5")
+    ida_bytes = sys.modules["ida_bytes"]
+    ida_bytes.find_bytes.return_value = 0x1169
+
+    ea = compat.find_bytes_masked(0x1000, 0x5000, b"\x55\x48", b"\xff\xff")
+
+    assert ea == 0x1169
+    ida_bytes.find_bytes.assert_called_once()
+    args, kwargs = ida_bytes.find_bytes.call_args
+    assert args[:2] == (b"\x55\x48", 0x1000)
+    assert kwargs["range_end"] == 0x5000 and kwargs["mask"] == b"\xff\xff"
+    ida_bytes.bin_search.assert_not_called()
+
+
+def test_find_bytes_masked_unwraps_bin_search_tuple_on_8x(load):
+    compat = load(kernel_version="8.4")
+    ida_bytes = sys.modules["ida_bytes"]
+    ida_bytes.bin_search.return_value = (0x2222, 0)  # tuple shape, defensively
+
+    assert compat.find_bytes_masked(0x1000, 0x5000, b"\x90", b"\xff") == 0x2222
+    ida_bytes.bin_search.assert_called_once_with(
+        0x1000, 0x5000, b"\x90", b"\xff", 1, compat.DEFAULT_SEARCH_FLAGS
+    )
+    ida_bytes.find_bytes.assert_not_called()
+
+
+def test_find_pattern_passes_wildcards_to_find_bytes_on_9x(load):
+    compat = load(kernel_version="9.5")
+    ida_bytes = sys.modules["ida_bytes"]
+    ida_bytes.find_bytes.return_value = 0x3333
+
+    assert compat.find_pattern(0x1000, 0x5000, "48 8B ?? ??") == 0x3333
+    args, kwargs = ida_bytes.find_bytes.call_args
+    assert args[:2] == ("48 8B ?? ??", 0x1000) and kwargs["range_end"] == 0x5000
+    ida_bytes.bin_search.assert_not_called()
+
+
+def test_find_pattern_8x_returns_badaddr_when_pattern_does_not_parse(load):
+    compat = load(kernel_version="8.4")
+    ida_bytes = sys.modules["ida_bytes"]
+    ida_bytes.compiled_binpat_vec_t.return_value = []  # nothing parsed
+    _mod("idaapi").BADADDR = 0xFFFFFFFFFFFFFFFF
+
+    assert compat.find_pattern(0x1000, 0x5000, "ZZ") == 0xFFFFFFFFFFFFFFFF
+    ida_bytes.bin_search.assert_not_called()
+
+
+def test_find_pattern_8x_unwraps_compiled_bin_search(load):
+    compat = load(kernel_version="8.4")
+    ida_bytes = sys.modules["ida_bytes"]
+    ida_bytes.compiled_binpat_vec_t.return_value = ["parsed"]
+    ida_bytes.bin_search.return_value = (0x4444, 0)
+
+    assert compat.find_pattern(0x1000, 0x5000, "90 90") == 0x4444
