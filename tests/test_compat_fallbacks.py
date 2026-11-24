@@ -264,3 +264,14 @@ def test_find_pattern_8x_unwraps_compiled_bin_search(load):
     ida_bytes.bin_search.return_value = (0x4444, 0)
 
     assert compat.find_pattern(0x1000, 0x5000, "90 90") == 0x4444
+
+
+def test_find_bytes_masked_8x_defaults_to_a_full_mask(load):
+    """The legacy overload needs an explicit mask; None means all bytes count."""
+    compat = load(kernel_version="8.4")
+    ida_bytes = sys.modules["ida_bytes"]
+    ida_bytes.bin_search.return_value = 0x5555
+
+    assert compat.find_bytes_masked(0x1000, 0x5000, b"\x55\x48", None) == 0x5555
+    args = ida_bytes.bin_search.call_args[0]
+    assert args[3] == b"\xff\xff" and args[4] == 2

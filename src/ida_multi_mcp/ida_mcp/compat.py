@@ -308,11 +308,11 @@ import ida_bytes
 DEFAULT_SEARCH_FLAGS = ida_bytes.BIN_SEARCH_FORWARD | ida_bytes.BIN_SEARCH_NOSHOW
 
 
-def _unwrap_bin_search(res: object) -> int:
+def _unwrap_bin_search(res: "int | tuple[int, int]") -> int:
     """bin_search returns (ea, index) on 9.x, scalar ea on 8.x. Normalize."""
     if isinstance(res, tuple):
         return res[0]
-    return res  # type: ignore[return-value]
+    return res
 
 
 def find_bytes_masked(
@@ -327,8 +327,10 @@ def find_bytes_masked(
     Works across IDA 8.x and 9.x."""
     if IDA_GE_90:
         return ida_bytes.find_bytes(data, ea, range_end=max_ea, mask=mask, flags=flags)
+    # The legacy overload needs an explicit mask; None means every byte counts.
+    full_mask = mask if mask is not None else b"\xFF" * len(data)
     return _unwrap_bin_search(
-        ida_bytes.bin_search(ea, max_ea, data, mask, len(data), flags)
+        ida_bytes.bin_search(ea, max_ea, data, full_mask, len(data), flags)
     )
 
 
