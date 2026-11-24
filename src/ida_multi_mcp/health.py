@@ -9,7 +9,7 @@ import sys
 import json
 import http.client
 import subprocess
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from .registry import InstanceRegistry
@@ -90,7 +90,7 @@ def ping_instance(host: str, port: int, timeout: float = 15.0) -> bool:
             conn.close()  # always release the socket, even on error
 
 
-def check_instance_health(instance: dict) -> bool:
+def check_instance_health(instance: dict[str, Any]) -> bool:
     """Check if an IDA instance is alive and responsive.
 
     Performs two checks:
@@ -148,7 +148,7 @@ def cleanup_stale_instances(registry: "InstanceRegistry", timeout_seconds: int =
     return removed
 
 
-def query_binary_identity(host: str, port: int, timeout: float = 5.0) -> dict | None:
+def query_binary_identity(host: str, port: int, timeout: float = 5.0) -> dict[str, Any] | None:
     """Read the loaded input's stored identity without hashing the disk file."""
     if host not in _ALLOWED_HOSTS:
         return None
@@ -177,7 +177,7 @@ def query_binary_identity(host: str, port: int, timeout: float = 5.0) -> dict | 
     return None
 
 
-def query_binary_metadata(host: str, port: int, timeout: float = 5.0) -> dict | None:
+def query_binary_metadata(host: str, port: int, timeout: float = 5.0) -> dict[str, Any] | None:
     """Query an IDA instance for its current binary metadata.
 
     Uses the ida://idb/metadata resource to get the current file info.
@@ -240,7 +240,7 @@ def _console_output(cmd: list[str], timeout: int = 10) -> str:
     before MCP ``initialize`` — the client sees
     ``handshake failed: connection closed: initialize response``.
     """
-    kwargs: dict = {
+    kwargs: dict[str, Any] = {
         "timeout": timeout,
         "stderr": subprocess.DEVNULL,
         "errors": "replace",
