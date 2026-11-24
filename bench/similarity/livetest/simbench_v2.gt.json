@@ -1,0 +1,17 @@
+{
+  "va2name": {
+    "0x1400015f0": "fnv_loop",
+    "0x140001630": "fnv_unrolled",
+    "0x140002de0": "main",
+    "0x140001450": "mix_o0",
+    "0x1400016d0": "mix_o2",
+    "0x1400014d0": "parse_ipv4_a",
+    "0x140001540": "parse_ipv4_b",
+    "0x1400015b0": "sort_asc",
+    "0x1400015d0": "sort_desc",
+    "0x140001700": "sum_array",
+    "0x140001730": "sum_array_while",
+    "0x1400017a0": "vm_exec",
+    "0x140001760": "xor_array"
+  }
+}

@@ -15,6 +15,7 @@ import idautils
 import idc
 
 from . import compat
+from ..identity import read_input_fingerprint
 from .rpc import resource
 from .sync import idasync
 from .utils import (
@@ -30,6 +31,16 @@ from .utils import (
 # ============================================================================
 # Core IDB State
 # ============================================================================
+
+
+@resource("ida://idb/identity")
+@idasync
+def idb_identity_resource() -> dict:
+   """Lightweight identity of the loaded input, independent of on-disk changes."""
+   return {
+      "module": ida_nalt.get_root_filename(),
+      "input_fingerprint": read_input_fingerprint(),
+   }
 
 
 @resource("ida://idb/metadata")
@@ -174,7 +185,7 @@ def types_resource() -> list[dict]:
 def structs_resource() -> list[dict]:
    """Get all structures/unions"""
    structs = []
-   limit = ida_typeinf.get_ordinal_limit()
+   limit = compat.get_ordinal_limit()
    for ordinal in range(1, limit):
       tif = ida_typeinf.tinfo_t()
       if tif.get_numbered_type(None, ordinal) and tif.is_udt():

@@ -12,6 +12,9 @@ from ida_multi_mcp.health import (
     check_instance_health,
     cleanup_stale_instances,
     query_binary_metadata,
+    rediscover_instances,
+    _console_output,
+    _find_ida_listening_ports,
 )
 
 
@@ -38,13 +41,19 @@ class TestIsProcessAlive:
 
     @pytest.mark.skipif(sys.platform != "win32", reason="Windows-only test")
     def test_windows_alive(self):
-        """Test Windows path with a mocked ctypes kernel32."""
+        """Running process: handle opens and exit code is STILL_ACTIVE."""
         mock_kernel32 = MagicMock()
         mock_kernel32.OpenProcess.return_value = 1234  # non-zero = handle found
-        mock_kernel32.CloseHandle.return_value = None
+
+        def _set_still_active(handle, exit_code_ptr):
+            exit_code_ptr._obj.value = 259  # STILL_ACTIVE
+            return 1
+
+        mock_kernel32.GetExitCodeProcess.side_effect = _set_still_active
         with patch("ctypes.windll") as mock_windll:
             mock_windll.kernel32 = mock_kernel32
             assert is_process_alive(5678) is True
+        mock_kernel32.CloseHandle.assert_called_once()
 
     @pytest.mark.skipif(sys.platform != "win32", reason="Windows-only test")
     def test_windows_not_alive(self):
@@ -53,6 +62,22 @@ class TestIsProcessAlive:
         with patch("ctypes.windll") as mock_windll:
             mock_windll.kernel32 = mock_kernel32
             assert is_process_alive(5678) is False
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="Windows-only test")
+    def test_windows_zombie_reports_dead(self):
+        """Exited process whose handle is still open must report dead."""
+        mock_kernel32 = MagicMock()
+        mock_kernel32.OpenProcess.return_value = 1234  # handle still openable
+
+        def _set_exited(handle, exit_code_ptr):
+            exit_code_ptr._obj.value = 0  # process exited with code 0
+            return 1
+
+        mock_kernel32.GetExitCodeProcess.side_effect = _set_exited
+        with patch("ctypes.windll") as mock_windll:
+            mock_windll.kernel32 = mock_kernel32
+            assert is_process_alive(5678) is False
+        mock_kernel32.CloseHandle.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -136,3 +161,71 @@ class TestQueryBinaryMetadata:
 
     def test_rejects_non_localhost(self):
         assert query_binary_metadata("10.0.0.1", 5000) is None
+
+
+# ---------------------------------------------------------------------------
+# Windows console discovery (PYTHONUTF8 / OEM)
+# ---------------------------------------------------------------------------
+
+class TestConsoleOutput:
+    def test_windows_uses_oem_and_replace(self):
+        with patch("ida_multi_mcp.health.sys.platform", "win32"):
+            with patch("subprocess.CREATE_NO_WINDOW", 0, create=True):
+                with patch("subprocess.check_output", return_value=None) as mock_output:
+                    assert _console_output(["tasklist", "/FO", "CSV", "/NH"]) == ""
+        kwargs = mock_output.call_args.kwargs
+        assert kwargs["encoding"] == "oem"
+        assert kwargs["errors"] == "replace"
+
+    def test_none_stdout_becomes_empty_string(self):
+        with patch("subprocess.check_output", return_value=None):
+            assert _console_output(["tasklist"]) == ""
+
+    def test_unicode_decode_error_becomes_empty_string(self):
+        err = UnicodeDecodeError("utf-8", b"\xb1", 0, 1, "invalid start byte")
+        with patch("subprocess.check_output", side_effect=err):
+            assert _console_output(["tasklist"]) == ""
+
+
+class TestFindIdaListeningPorts:
+    def test_empty_console_output_does_not_crash(self):
+        with patch("ida_multi_mcp.health.sys.platform", "win32"):
+            with patch("ida_multi_mcp.health._console_output", return_value=""):
+                assert _find_ida_listening_ports() == []
+
+    def test_parses_english_listen_state(self):
+        def fake_output(cmd, timeout=10):
+            if cmd[0] == "tasklist":
+                return '"ida.exe","4242","Console","1","100,000 K"\n'
+            return "  TCP    127.0.0.1:57079         0.0.0.0:0              LISTENING       4242\n"
+
+        with patch("ida_multi_mcp.health.sys.platform", "win32"):
+            with patch("ida_multi_mcp.health._console_output", side_effect=fake_output):
+                assert _find_ida_listening_ports() == [(4242, 57079)]
+
+    def test_parses_localized_listen_state_and_session_name(self):
+        def fake_output(cmd, timeout=10):
+            if cmd[0] == "tasklist":
+                return '"ida64.exe","4242","控制台","1","100,000 K"\n'
+            return "  TCP    127.0.0.1:57079         0.0.0.0:0              侦听            4242\n"
+
+        with patch("ida_multi_mcp.health.sys.platform", "win32"):
+            with patch("ida_multi_mcp.health._console_output", side_effect=fake_output):
+                assert _find_ida_listening_ports() == [(4242, 57079)]
+
+    def test_parses_ipv6_local_address(self):
+        def fake_output(cmd, timeout=10):
+            if cmd[0] == "tasklist":
+                return '"ida.exe","99","Console","1","8 K"\n'
+            return "  TCP    [::1]:12345            [::]:0                 LISTENING       99\n"
+
+        with patch("ida_multi_mcp.health.sys.platform", "win32"):
+            with patch("ida_multi_mcp.health._console_output", side_effect=fake_output):
+                assert _find_ida_listening_ports() == [(99, 12345)]
+
+
+class TestRediscoverInstances:
+    def test_swallows_unexpected_errors(self):
+        registry = MagicMock()
+        registry.list_instances.side_effect = RuntimeError("boom")
+        assert rediscover_instances(registry) == []

@@ -1,3 +1,11 @@
+# zeromcp for the IDA plugin/worker (HTTP transport).
+#
+# A second copy lives at ida_multi_mcp/vendor/zeromcp/mcp.py and is used by the
+# router over stdio. The two are deliberately separate: the router must not
+# import ida_mcp (which pulls in IDA dependencies), and some behavior is
+# transport-specific — this copy logs to stdout (IDA console / captured worker
+# stderr), whereas the stdio copy must log to stderr. Keep shared,
+# transport-neutral fixes mirrored across both copies.
 import re
 import sys
 import time
@@ -331,6 +339,7 @@ class McpServer:
         self.registry.methods["resources/read"] = self._mcp_resources_read
         self.registry.methods["prompts/list"] = self._mcp_prompts_list
         self.registry.methods["prompts/get"] = self._mcp_prompts_get
+        self.registry.methods["notifications/initialized"] = self._mcp_notifications_initialized
         self.registry.methods["notifications/cancelled"] = self._mcp_notifications_cancelled
 
     def tool(self, func: Callable) -> Callable:
@@ -540,6 +549,12 @@ class McpServer:
         finally:
             if request_id is not None:
                 unregister_pending_request(request_id)
+
+    def _mcp_notifications_initialized(self) -> None:
+        """MCP notifications/initialized - client signals init complete"""
+        # No-op: notification acknowledgement, no response needed. Registering
+        # it avoids a spurious "Method not found" log on each client handshake.
+        pass
 
     def _mcp_notifications_cancelled(self, requestId: int | str, reason: str | None = None) -> None:
         """MCP notifications/cancelled - cancel an in-flight request"""

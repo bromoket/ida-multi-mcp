@@ -16,6 +16,7 @@ import ida_typeinf
 import ida_segment
 import idc
 
+from . import compat
 from .rpc import tool
 from .sync import idasync, tool_timeout
 
@@ -24,6 +25,9 @@ _strings_cache: list[tuple[int, str]] | None = None
 
 # Cached function list: [Function(...), ...]
 _funcs_cache: list["Function"] | None = None
+
+# Cached function query metadata: [{addr, name, size, size_int, has_type}, ...]
+_funcs_query_cache: list[dict] | None = None
 
 # Cached globals list: [Global(...), ...]
 _globals_cache: list["Global"] | None = None
@@ -51,10 +55,37 @@ def _get_funcs_cache() -> list["Function"]:
     return _funcs_cache
 
 
+def _get_funcs_query_cache() -> list[dict]:
+    """Lightweight func_query rows derived from the warm functions cache.
+
+    Reuses _funcs_cache (addr/name/size) and only adds size_int, so it does
+    NO per-function IDA calls and stays fast even on 100K+ function binaries.
+    has_type is intentionally NOT precomputed here (a get_tinfo() per function
+    would re-introduce a full scan that times out); func_query computes it
+    lazily only for the rows it actually returns or filters on. Invalidated
+    together with _funcs_cache.
+    """
+    global _funcs_query_cache
+    if _funcs_query_cache is None:
+        rows: list[dict] = []
+        for fn in _get_funcs_cache():
+            try:
+                size_int = int(fn["size"], 16)
+            except (KeyError, ValueError, TypeError):
+                size_int = 0
+            rows.append({
+                "addr": fn["addr"], "name": fn["name"],
+                "size": fn["size"], "size_int": size_int,
+            })
+        _funcs_query_cache = rows
+    return _funcs_query_cache
+
+
 def invalidate_funcs_cache():
-    """Clear the function cache (call after function changes)."""
-    global _funcs_cache
+    """Clear the function caches (call after function changes)."""
+    global _funcs_cache, _funcs_query_cache
     _funcs_cache = None
+    _funcs_query_cache = None
 
 
 def _get_globals_cache() -> list["Global"]:
@@ -168,7 +199,10 @@ def _parse_func_query(query: str) -> int:
 def lookup_funcs(
     queries: Annotated[list[str] | str, "Address(es) or name(s)"],
 ) -> list[dict]:
-    """Get functions by address or name (auto-detects)"""
+    """Resolve functions by address or by name; the form is auto-detected.
+
+    Accepts 0x-prefixed addresses, sub_XXXX names, or real symbol names. Use
+    this to turn a name from decompiler output into an address to work with."""
     queries = normalize_list_input(queries)
 
     # Treat empty/"*" as "all functions" - but add limit
@@ -213,7 +247,9 @@ def int_convert(
         "Convert numbers to various formats (hex, decimal, binary, ascii)",
     ],
 ) -> list[dict]:
-    """Convert numbers to different formats"""
+    """Convert numbers between hex, decimal, binary and ASCII, in batch.
+
+    Pure computation — no IDB access, so it needs no instance state."""
     inputs = normalize_dict_list(inputs, lambda s: {"text": s, "size": 64})
 
     results = []
@@ -283,7 +319,12 @@ def list_funcs(
         "List functions with optional filtering and pagination",
     ],
 ) -> list[Page[Function]]:
-    """List functions"""
+    """List functions in the binary, paginated.
+
+    Requires auto-analysis to be finished — call analysis_wait() first on a
+    freshly opened binary or this returns a partial list. On large binaries use
+    count/offset rather than fetching everything; count=0 with a glob filter is
+    a full scan."""
     queries = normalize_dict_list(
         queries, lambda s: {"offset": 0, "count": 50, "filter": s}
     )
@@ -313,7 +354,10 @@ def list_globals(
         "List global variables with optional filtering and pagination",
     ],
 ) -> list[Page[Global]]:
-    """List globals"""
+    """List global variables (non-function named addresses), paginated.
+
+    Requires auto-analysis to be finished — call analysis_wait() first on a
+    freshly opened binary or names will still be missing."""
     queries = normalize_dict_list(
         queries, lambda s: {"offset": 0, "count": 50, "filter": s}
     )
@@ -341,7 +385,10 @@ def imports(
     offset: Annotated[int, "Offset"],
     count: Annotated[int, "Count (0=all)"],
 ) -> Page[Import]:
-    """List imports"""
+    """List imported functions grouped by source module.
+
+    Useful early: the import set is a fast signal of what a binary can do
+    (networking, crypto, process injection) before you decompile anything."""
     nimps = ida_nalt.get_import_module_qty()
 
     rv = []
@@ -426,7 +473,10 @@ def _build_health_payload() -> dict:
         "uptime_sec": round(time.time() - _SERVER_START_TIME, 1),
         "idb_path": path,
         "module": module,
-        "auto_analysis_ready": not ida_auto.auto_is_ok(),
+        # auto_is_ok() is "are all queues empty", i.e. True once analysis has
+        # finished. This was negated, so the field reported the opposite of the
+        # truth in both directions and agents proceeded on a half-analysed IDB.
+        "auto_analysis_ready": bool(ida_auto.auto_is_ok()),
         "hexrays_ready": bool(ida_hexrays.init_hexrays_plugin()),
         "strings_cache_ready": _strings_cache is not None,
         "strings_cache_size": len(_strings_cache) if _strings_cache else 0,
@@ -440,6 +490,145 @@ def server_health() -> dict:
     uptime, IDB path, auto-analysis status, Hex-Rays availability, and
     strings cache state."""
     return _build_health_payload()
+
+
+_AUTO_STATE_NAMES = {
+    "AU_NONE": "idle",
+    "AU_UNK": "reanalysing unexplored bytes",
+    "AU_CODE": "converting to instructions",
+    "AU_WEAK": "converting to instructions (weak)",
+    "AU_PROC": "creating functions",
+    "AU_TAIL": "adding function tails",
+    "AU_FCHUNK": "finding function chunks",
+    "AU_USED": "reanalysing dependent instructions",
+    "AU_TYPE": "applying type information",
+    "AU_LIBF": "identifying library functions",
+    "AU_CHLB": "identifying library functions (delayed)",
+    "AU_FINAL": "final analysis pass",
+}
+
+
+def _auto_state_label(finished: bool) -> str:
+    """Human-readable name of whatever the autoanalyser is doing right now.
+
+    Note this runs on the IDA main thread, which is exactly what IDA borrows
+    back from the analyser to service our request — so get_auto_state() very
+    often reads AU_NONE even with work still queued. Report that as "queued"
+    rather than "idle", which would contradict finished=False.
+    """
+    if finished:
+        return "idle"
+    try:
+        state = ida_auto.get_auto_state()
+    except Exception:
+        return "unknown"
+    if state == getattr(ida_auto, "AU_NONE", 0):
+        return "queued (paused while servicing this request)"
+    for const, label in _AUTO_STATE_NAMES.items():
+        if const == "AU_NONE":
+            continue
+        value = getattr(ida_auto, const, None)
+        if value is not None and state == value:
+            return label
+    return f"running (state={state})"
+
+
+@tool
+@idasync
+def analysis_status() -> dict:
+    """Check whether IDA's auto-analysis has work outstanding. Non-blocking.
+
+    On a freshly opened binary, analysis runs in the background and the function
+    list, xrefs, strings and decompiler output are all INCOMPLETE until it
+    settles. Check this before drawing conclusions from a first pass, and use
+    analysis_wait() to drive it to completion.
+
+    `queue_empty` is a SNAPSHOT, not a latch. It reports IDA's auto_is_ok() at
+    this instant — "are the analysis queues empty right now". IDA re-queues work
+    as it goes, so the value can read True and then False again moments later;
+    observed live on a 23MB DLL. Read it as:
+
+      queue_empty=False -> definitely still working, do not trust results yet
+      queue_empty=True  -> nothing queued at this instant; combine with a stable
+                           function_count across calls before treating analysis
+                           as done
+
+    `finished` is kept as an alias of `queue_empty` for compatibility and
+    carries the same caveat."""
+    queue_empty = bool(ida_auto.auto_is_ok())
+    return {
+        "queue_empty": queue_empty,
+        # Alias: same snapshot value, same caveat. Not a completion latch.
+        "finished": queue_empty,
+        "state": _auto_state_label(queue_empty),
+        "function_count": ida_funcs.get_func_qty(),
+        "hint": (
+            "No analysis queued at this instant. This is a snapshot, not a "
+            "guarantee — confirm function_count has stopped changing before "
+            "treating the database as fully analysed."
+            if queue_empty
+            else "Analysis still has work queued — call analysis_wait() before relying on results."
+        ),
+    }
+
+
+@tool
+@idasync
+@tool_timeout(300.0)
+def analysis_step(
+    max_sec: Annotated[float, "Seconds to spend driving analysis (default 5, max 30)"] = 5.0,
+) -> dict:
+    """Drive IDA's auto-analysis queue for a bounded slice, then return.
+
+    Prefer analysis_wait(), which calls this in a loop with a real timeout.
+
+    IDA's background analysis stalls short of completion: measured on a 23MB
+    DLL it climbed to 73,928 functions on its own and then sat there, never
+    flipping auto_is_ok(). Something has to drain the residual queue.
+
+    Stepping one address at a time keeps each call bounded by max_sec, so the
+    instance stays responsive through the long bulk phase. Once the range is
+    drained this makes one closing auto_wait() call, which is unbounded and is
+    the only thing that actually flips auto_is_ok() — see the comment below.
+    That final slice therefore runs past max_sec.
+    """
+    budget = max(0.0, min(float(max_sec), 30.0))
+    lo, hi = compat.inf_get_min_ea(), compat.inf_get_max_ea()
+    before = ida_funcs.get_func_qty()
+    t0 = time.perf_counter()
+    deadline = time.monotonic() + budget
+
+    steps = 0
+    drained = False
+    finalized = False
+    while time.monotonic() < deadline:
+        if ida_auto.auto_is_ok():
+            break
+        if not ida_auto.auto_make_step(lo, hi):
+            # Range drained, but auto_is_ok() can still be False: there is a
+            # closing pass that only auto_wait() performs. Measured on a 23MB
+            # DLL, stepping produced all 73,929 functions and left the flag
+            # False; one auto_wait() then took 34.5s, added zero functions, and
+            # flipped it. So the last slice runs long by design — it is the only
+            # way to reach a genuine "analysis finished".
+            drained = True
+            ida_auto.auto_wait()
+            finalized = True
+            break
+        steps += 1
+
+    finished = bool(ida_auto.auto_is_ok())
+    after = ida_funcs.get_func_qty()
+    return {
+        "finished": finished,
+        "steps": steps,
+        "drained_range": drained,
+        "finalized": finalized,
+        "elapsed_sec": round(time.perf_counter() - t0, 2),
+        "function_count": after,
+        "functions_added": after - before,
+        "state": _auto_state_label(finished),
+    }
 
 
 @tool
@@ -508,6 +697,7 @@ def _collect_imports() -> list[dict]:
 
 @tool
 @idasync
+@tool_timeout(60.0)
 def func_query(
     queries: Annotated[list[dict] | dict,
         "Function query: filter, name_regex, min_size, max_size, has_type, sort_by, descending, offset, count"],
@@ -517,18 +707,18 @@ def func_query(
     Example: {name_regex: 'crypt', min_size: 100, sort_by: 'size', descending: true}"""
     queries = normalize_dict_list(queries)
 
-    all_functions: list[dict] = []
-    for addr in idautils.Functions():
-        fn = idaapi.get_func(addr)
-        if not fn:
-            continue
-        size_int = fn.end_ea - fn.start_ea
-        fn_name = ida_funcs.get_func_name(fn.start_ea) or "<unnamed>"
-        has_type = bool(ida_nalt.get_tinfo(ida_typeinf.tinfo_t(), fn.start_ea))
-        all_functions.append({
-            "addr": hex(fn.start_ea), "name": fn_name,
-            "size": hex(size_int), "size_int": size_int, "has_type": has_type,
-        })
+    # Shared, cached metadata — must not be mutated in place below.
+    all_functions = _get_funcs_query_cache()
+
+    # has_type is resolved lazily: a get_tinfo() per function over the whole
+    # binary would time out on 100K+ function targets. Reuse one tinfo_t.
+    _tif = ida_typeinf.tinfo_t()
+
+    def _has_type(row: dict) -> bool:
+        try:
+            return bool(ida_nalt.get_tinfo(_tif, int(row["addr"], 16)))
+        except (ValueError, TypeError):
+            return False
 
     results = []
     for query in queries:
@@ -559,8 +749,14 @@ def func_query(
         if max_size is not None:
             filtered = [f for f in filtered if f["size_int"] <= int(max_size)]
 
+        # has_type filter: compute only for the already name/size-narrowed set.
         if "has_type" in query:
-            filtered = [f for f in filtered if f["has_type"] is bool(query["has_type"])]
+            want = bool(query["has_type"])
+            filtered = [f for f in filtered if _has_type(f) is want]
+
+        # Copy before sorting in place when no filter narrowed the shared cache.
+        if filtered is all_functions:
+            filtered = list(filtered)
 
         if sort_by == "name":
             filtered.sort(key=lambda f: f["name"].lower(), reverse=descending)
@@ -570,7 +766,12 @@ def func_query(
             filtered.sort(key=lambda f: int(f["addr"], 16), reverse=descending)
 
         page = paginate(filtered, offset, count)
-        page["data"] = [{k: v for k, v in item.items() if k != "size_int"} for item in page["data"]]
+        # Resolve has_type only for the returned page (≤ count rows).
+        page["data"] = [
+            {**{k: v for k, v in item.items() if k != "size_int"},
+             "has_type": _has_type(item)}
+            for item in page["data"]
+        ]
         results.append(page)
 
     return results
@@ -608,21 +809,13 @@ def imports_query(
 def idb_save(
     path: Annotated[str, "Optional destination path (default: current IDB path)"] = "",
 ) -> dict:
-    """Save active IDB to disk. Call after renaming, retyping, or commenting
-    to persist changes. Optionally specify a custom output path.
-
-    GUI-safe (upstream fix, issue #446): in the GUI the open database is backed
-    by loose working files (.id0/.id1/.id2/.nam/.til) that IDA actively manages;
-    packing+killing them out from under the running GUI corrupts the database on
-    the next reopen. So in GUI mode this uses IDA's native in-place save
-    (save_database(None, 0), equivalent to Ctrl+W), and for an explicit different
-    destination writes a compressed copy WITHOUT killing the live working files.
-    Only headless idalib -- which has no live loose files to clobber -- packs
-    into a single compressed .i64/.idb."""
+    """Save active IDB to disk, with no dialogs. Call after renaming, retyping,
+    or commenting to persist changes. Optionally specify a custom output path
+    to write a copy instead, leaving the open database untouched."""
     try:
-        save_path = path.strip() if path else ""
-        if not save_path:
-            save_path = ida_loader.get_path(ida_loader.PATH_TYPE_IDB)
+        requested = path.strip() if path else ""
+        current = ida_loader.get_path(ida_loader.PATH_TYPE_IDB)
+        save_path = requested or current
         if not save_path:
             return {"ok": False, "path": None, "error": "Could not resolve IDB path"}
 
@@ -631,22 +824,30 @@ def idb_save(
         except Exception:
             is_gui = False
 
-        if is_gui:
-            # GUI: never DBFL_KILL the loose files of the open database.
-            current = ida_loader.get_path(ida_loader.PATH_TYPE_IDB)
-            if path and save_path != current:
-                # Save-as a compressed snapshot to a new path; leaves the live
-                # working files intact.
-                ok = bool(ida_loader.save_database(save_path, ida_loader.DBFL_COMP))
-            else:
-                # Native in-place save (Ctrl+W).
-                ok = bool(ida_loader.save_database(None, 0))
+        saving_copy = bool(requested) and requested != current
+
+        if saving_copy:
+            # Explicit different destination: write a compressed snapshot and
+            # leave the live working files alone.
+            flags = getattr(ida_loader, "DBFL_COMP", 0)
+            ok = bool(ida_loader.save_database(save_path, flags))
+        elif is_gui:
+            # In the GUI the open database is backed by loose .id0/.id1/.id2/
+            # .nam/.til files that IDA is actively using. Pass None for the
+            # in-place save IDA itself performs on Ctrl+W; handing it an
+            # explicit path takes the save-as route instead.
+            ok = bool(ida_loader.save_database(None, 0))
         else:
-            # Headless idalib: safe to pack into a single compressed file.
-            flags = ida_loader.DBFL_KILL | ida_loader.DBFL_COMP
+            # Headless: nothing else holds the working files, so pack into one
+            # compressed database.
+            flags = getattr(ida_loader, "DBFL_KILL", 0) | getattr(ida_loader, "DBFL_COMP", 0)
             ok = bool(ida_loader.save_database(save_path, flags))
 
-        result: dict = {"ok": ok, "path": save_path}
+        result: dict = {
+            "ok": ok,
+            "path": save_path,
+            "mode": "copy" if saving_copy else ("gui-in-place" if is_gui else "headless-packed"),
+        }
         if not ok:
             result["error"] = "save_database returned false"
         return result

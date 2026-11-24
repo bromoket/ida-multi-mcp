@@ -7,6 +7,8 @@ import os
 import re
 import sys
 import json
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -15,7 +17,7 @@ from .registry import InstanceRegistry
 from .router import InstanceRouter
 from .health import cleanup_stale_instances, rediscover_instances
 from .idalib_manager import IdalibManager
-from .tools import management, idalib as idalib_tools
+from .tools import management, idalib as idalib_tools, similarity
 from .cache import get_cache, DEFAULT_MAX_OUTPUT_CHARS
 
 # Static IDA tool schemas (loaded once at import time)
@@ -28,13 +30,103 @@ def _load_static_ida_tools() -> list[dict]:
     global _STATIC_IDA_TOOLS
     if _STATIC_IDA_TOOLS is None:
         try:
-            with open(_STATIC_IDA_TOOLS_PATH, "r") as f:
+            with open(_STATIC_IDA_TOOLS_PATH, "r", encoding="utf-8") as f:
                 _STATIC_IDA_TOOLS = json.load(f)
         except Exception as e:
             print(f"[ida-multi-mcp] Warning: failed to load static tool schemas: {e}",
                   file=sys.stderr)
             _STATIC_IDA_TOOLS = []
     return _STATIC_IDA_TOOLS
+
+
+_SERVER_INSTRUCTIONS = """\
+ida-multi-mcp routes tool calls to one or more running IDA Pro instances.
+
+WORKFLOW — follow this order when you start on a binary:
+
+1. `list_instances()` to see what is loaded and get each `instance_id`.
+2. `analysis_wait(instance_id=...)` BEFORE any analysis work on a newly opened
+   binary. IDA analyses in the background, and until it settles the function
+   list, xrefs, strings and decompiler output are all INCOMPLETE — on a 23MB DLL
+   that was 12,885 missing functions, not a rounding error. If it returns
+   `finished: false` it timed out rather than failed, so call it again. Treat
+   `finished` as a snapshot rather than a latch: IDA re-queues work, so the flag
+   can flip back. `functions_added` reaching 0 across successive calls is the
+   durable signal. `analysis_status()` is the non-blocking check.
+3. `survey_binary(instance_id=...)` for a one-call overview before drilling in.
+
+ROUTING — pass `instance_id` on every tool call. It is required whenever two or
+more instances are registered; with exactly one it may be omitted.
+
+COST — IDA runs each instance on a single main thread. Calls to different
+instances proceed in parallel, but calls to the SAME instance queue behind one
+another, and a long scan makes that instance unresponsive. Prefer the batch and
+`*_query` tools over looping, paginate with count/offset on large binaries, and
+use `decompile_to_file` instead of decompiling functions one at a time.
+
+PERSISTENCE — renames, retypes and comments live in memory until `idb_save()`.
+"""
+
+
+# Tools whose results are silently wrong on a partially analysed IDB.
+# Deliberately not every tool: the warning has to stay rare enough to be read.
+_ANALYSIS_SENSITIVE_TOOLS = frozenset({
+    "list_funcs", "func_query", "func_profile", "classify_functions",
+    "lookup_funcs", "export_funcs", "list_globals", "survey_binary",
+    "callgraph", "callees", "xrefs_to", "xrefs_from", "xrefs_to_field",
+    "analyze_component", "analyze_batch", "index_functions", "similar_functions",
+})
+_ANALYSIS_STATE_TTL_SEC = 10.0
+
+
+def _json_text(value: Any) -> str:
+    return json.dumps(value, separators=(",", ":"))
+
+
+def _schema_preserving_preview(value: Any, max_chars: int) -> Any:
+    """Return a smaller value of the same JSON type (str/list/dict) when huge."""
+    if max_chars <= 0:
+        return value
+    try:
+        if len(_json_text(value)) <= max_chars:
+            return value
+    except Exception:
+        return value
+
+    if isinstance(value, str):
+        return value[:max_chars]
+
+    if isinstance(value, list):
+        # Accumulate serialized length per item instead of re-serializing
+        # the whole prefix each iteration (which is quadratic).
+        out: list[Any] = []
+        used = 2  # "[" and "]"
+        for item in value:
+            try:
+                item_len = len(_json_text(item))
+            except Exception:
+                break
+            used += item_len + (1 if out else 0)  # +1 for comma separator
+            if used > max_chars:
+                break
+            out.append(item)
+        return out
+
+    if isinstance(value, dict):
+        def _truncate(v: Any, depth: int = 0) -> Any:
+            if depth > 6:
+                return v
+            if isinstance(v, str) and len(v) > 1000:
+                return v[:1000] + f"... [{len(v)} chars total]"
+            if isinstance(v, list):
+                return [_truncate(x, depth + 1) for x in v[:50]]
+            if isinstance(v, dict):
+                return {k: _truncate(x, depth + 1) for k, x in v.items()}
+            return v
+
+        return _truncate(value)
+
+    return value
 
 
 class IdaMultiMcpServer:
@@ -57,20 +149,29 @@ class IdaMultiMcpServer:
         """
         self.registry = InstanceRegistry(registry_path)
         self.router = InstanceRouter(self.registry)
-        self.server = McpServer("ida-multi-mcp", version="1.0.0")
+        self.server = McpServer(
+            "ida-multi-mcp", version="1.0.0", instructions=_SERVER_INSTRUCTIONS
+        )
 
         # idalib lifecycle manager
         self.idalib_manager = IdalibManager(self.registry, python_executable=idalib_python)
 
-        # Tool cache
+        # Tool cache. Rebound wholesale by _refresh_tools rather than mutated,
+        # so concurrent readers on stdio worker threads always see a complete map.
         self._tool_cache: dict[str, dict] = {}
         self._cache_valid = False
+        self._refresh_lock = threading.Lock()
+        # instance_id -> (analysis_incomplete, monotonic timestamp)
+        self._analysis_state_cache: dict[str, tuple[bool, float]] = {}
+        self._analysis_state_lock = threading.Lock()
 
         # Set up management tools
         management.set_registry(self.registry)
         management.set_refresh_callback(self._refresh_tools)
         management.set_router(self.router)
         idalib_tools.set_manager(self.idalib_manager)
+        similarity.set_registry(self.registry)
+        similarity.set_router(self.router)
 
         # Register handlers
         self._register_handlers()
@@ -108,50 +209,6 @@ class IdaMultiMcpServer:
                 return structured.get("result")
 
             return structured
-
-        def _json_text(value: Any) -> str:
-            return json.dumps(value, separators=(",", ":"))
-
-        def _schema_preserving_preview(value: Any, max_chars: int) -> Any:
-            """Return a smaller value of the same JSON type (str/list/dict) when huge."""
-            if max_chars <= 0:
-                return value
-            try:
-                if len(_json_text(value)) <= max_chars:
-                    return value
-            except Exception:
-                return value
-
-            if isinstance(value, str):
-                return value[:max_chars]
-
-            if isinstance(value, list):
-                out: list[Any] = []
-                for item in value:
-                    out.append(item)
-                    try:
-                        if len(_json_text(out)) > max_chars:
-                            out.pop()
-                            break
-                    except Exception:
-                        break
-                return out
-
-            if isinstance(value, dict):
-                def _truncate(v: Any, depth: int = 0) -> Any:
-                    if depth > 6:
-                        return v
-                    if isinstance(v, str) and len(v) > 1000:
-                        return v[:1000] + f"... [{len(v)} chars total]"
-                    if isinstance(v, list):
-                        return [_truncate(x, depth + 1) for x in v[:50]]
-                    if isinstance(v, dict):
-                        return {k: _truncate(x, depth + 1) for k, x in v.items()}
-                    return v
-
-                return _truncate(value)
-
-            return value
 
         # Override tools/list to return cached tools
 
@@ -208,6 +265,14 @@ class IdaMultiMcpServer:
                         "isError": True
                     }
 
+            elif name == "analysis_wait":
+                result = management.analysis_wait(arguments)
+                return {
+                    "content": [{"type": "text", "text": _json_text(result)}],
+                    "structuredContent": result,
+                    "isError": "error" in result,
+                }
+
             elif name == "compare_binaries":
                 result = management.compare_binaries(arguments)
                 return {
@@ -231,6 +296,15 @@ class IdaMultiMcpServer:
                     "content": [{"type": "text", "text": _json_text(result)}],
                     "structuredContent": result,
                     "isError": "error" in result
+                }
+
+            # Similarity tools (local, cross-instance capable)
+            elif name in similarity.TOOL_NAMES:
+                result = similarity.dispatch(name, arguments)
+                return {
+                    "content": [{"type": "text", "text": _json_text(result)}],
+                    "structuredContent": result,
+                    "isError": "error" in result,
                 }
 
             # idalib management tools (local)
@@ -304,11 +378,34 @@ class IdaMultiMcpServer:
                 if not content:
                     content = [{"type": "text", "text": _json_text(structured)}]
 
+                # Results from a still-analysing IDB are silently partial. A
+                # description telling the caller to gate on analysis_wait() only
+                # helps if they read it first, so say it again here, attached to
+                # the incomplete answer itself.
+                #
+                # Appended to every return path below, not once here: the
+                # truncation branch builds a fresh content list, and that branch
+                # is the one a big half-analysed binary always takes.
+                analysis_note: list[dict] = []
+                if name in _ANALYSIS_SENSITIVE_TOOLS and self._analysis_incomplete(
+                    arguments.get("instance_id")
+                ):
+                    analysis_note = [{
+                        "type": "text",
+                        "text": (
+                            "\n[ida-multi-mcp] WARNING: IDA auto-analysis has NOT finished on "
+                            "this instance. Functions, xrefs, strings and decompiler output are "
+                            "incomplete, and this result is very likely missing data. Call "
+                            "analysis_wait(instance_id=...) and then repeat this call before "
+                            "drawing any conclusions."
+                        ),
+                    }]
+
                 # If the tool has an output schema, Factory requires structuredContent.
                 # Even on errors, keep the structured payload if present.
                 if is_error:
                     return {
-                        "content": content,
+                        "content": list(content) + analysis_note,
                         **({"structuredContent": structured} if structured is not None else {}),
                         "isError": True,
                     }
@@ -335,18 +432,52 @@ class IdaMultiMcpServer:
                     )
 
                     return {
-                        "content": [{"type": "text", "text": preview_text[:max_output] + truncation_notice}],
+                        "content": [
+                            {"type": "text", "text": preview_text[:max_output] + truncation_notice}
+                        ] + analysis_note,
                         "structuredContent": preview_structured,
                         "isError": False,
                     }
 
                 return {
-                    "content": content,
+                    "content": list(content) + analysis_note,
                     "structuredContent": structured,
                     "isError": False,
                 }
 
         self.server.registry.methods["tools/call"] = custom_tools_call
+
+    def _analysis_incomplete(self, instance_id: str | None) -> bool:
+        """Whether the instance is still auto-analysing.
+
+        Cached briefly: this runs on every analysis-sensitive call, and the
+        answer only ever flips once per database. Anything unknown (no instance,
+        probe failed) reports False — a spurious warning on every result would
+        train the caller to ignore it.
+        """
+        if not instance_id:
+            return False
+        now = time.monotonic()
+        with self._analysis_state_lock:
+            entry = self._analysis_state_cache.get(instance_id)
+            if entry is not None and now - entry[1] < _ANALYSIS_STATE_TTL_SEC:
+                return entry[0]
+
+        try:
+            resp = self.router.route_request(
+                "tools/call",
+                {"name": "analysis_status", "arguments": {"instance_id": instance_id}},
+            )
+            structured = resp.get("structuredContent") if isinstance(resp, dict) else None
+            if not isinstance(structured, dict) or "finished" not in structured:
+                return False
+            incomplete = not bool(structured["finished"])
+        except Exception:
+            return False
+
+        with self._analysis_state_lock:
+            self._analysis_state_cache[instance_id] = (incomplete, now)
+        return incomplete
 
     def _handle_decompile_to_file(self, arguments: dict) -> dict:
         """Decompile functions and save results to local files.
@@ -357,6 +488,7 @@ class IdaMultiMcpServer:
         addrs = arguments.get("addrs", [])
         output_dir = arguments.get("output_dir", ".")
         mode = arguments.get("mode", "single")
+        allow_outside_cwd = arguments.get("allow_outside_cwd", False)
         instance_id = arguments.get("instance_id")
         if not instance_id:
             return {
@@ -369,7 +501,20 @@ class IdaMultiMcpServer:
         # Reject absolute paths that escape CWD unless they are subdirectories
         if ".." in os.path.normpath(output_dir).split(os.sep):
             return {"error": "output_dir must not contain '..' path components"}
-        # Warn but allow absolute paths (they may be intentional from the user)
+        # Security: confine output to the current working directory by default.
+        # Tool arguments here are LLM-generated, so an injected absolute path
+        # (e.g. a system directory) must not silently receive written files.
+        # Callers can opt out explicitly with allow_outside_cwd=true.
+        if not allow_outside_cwd:
+            cwd = os.path.realpath(os.getcwd())
+            if resolved_dir != cwd and not resolved_dir.startswith(cwd + os.sep):
+                return {
+                    "error": (
+                        "output_dir must be within the current working directory. "
+                        "Pass allow_outside_cwd=true to write elsewhere."
+                    ),
+                    "cwd": cwd,
+                }
         output_dir = resolved_dir
 
         # addr → name mapping (populated by list_funcs when using 'all')
@@ -500,13 +645,23 @@ class IdaMultiMcpServer:
     def _refresh_tools(self) -> int:
         """Refresh tool cache from IDA instances.
 
+        Discovery does HTTP round-trips per instance and takes real time, so the
+        new cache is built into a local dict and swapped in at the end rather
+        than mutated in place. The lock keeps two concurrent refreshes (e.g. a
+        tools/list miss racing the one idalib_open triggers) from duplicating
+        that work.
+
         Returns:
             Number of tools discovered
         """
-        self._tool_cache = {}
+        with self._refresh_lock:
+            return self._build_tool_cache()
+
+    def _build_tool_cache(self) -> int:
+        cache = {}
 
         # Add management tools
-        self._tool_cache["list_instances"] = {
+        cache["list_instances"] = {
             "name": "list_instances",
             "description": "List all registered IDA Pro instances with their metadata.",
             "inputSchema": {
@@ -541,7 +696,7 @@ class IdaMultiMcpServer:
             }
         }
 
-        self._tool_cache["refresh_tools"] = {
+        cache["refresh_tools"] = {
             "name": "refresh_tools",
             "description": "Re-discover tools from IDA Pro instances.",
             "inputSchema": {
@@ -551,7 +706,34 @@ class IdaMultiMcpServer:
             }
         }
 
-        self._tool_cache["compare_binaries"] = {
+        cache["analysis_wait"] = {
+            "name": "analysis_wait",
+            "description": (
+                "Drive IDA's auto-analysis to completion on an instance, then return. "
+                "CALL THIS ONCE AFTER OPENING A BINARY, BEFORE ANY ANALYSIS WORK: until "
+                "analysis settles, the function list, xrefs, strings and decompiler output "
+                "are all incomplete - on a 23MB DLL that was 12,885 functions missing. "
+                "If it returns finished=false the wait timed out rather than failed - call "
+                "it again to keep waiting. NOTE finished reflects IDA's instantaneous "
+                "'queues empty' flag, not a permanent latch, so it can read true and then "
+                "false again; functions_added reaching 0 across successive calls is the "
+                "more durable signal that analysis has settled. "
+                "Use analysis_status() for a non-blocking check."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "instance_id": {"type": "string", "description": "Target IDA instance ID (required)"},
+                    "timeout_sec": {
+                        "type": "number",
+                        "description": "Seconds to wait before returning (default 120, max 600)",
+                    },
+                },
+                "required": ["instance_id"],
+            },
+        }
+
+        cache["compare_binaries"] = {
             "name": "compare_binaries",
             "description": "Compare two IDA instances by diffing their binary metadata, entrypoints, and segments. Takes two instance_id values and returns what is common vs unique to each.",
             "inputSchema": {
@@ -564,7 +746,7 @@ class IdaMultiMcpServer:
             }
         }
 
-        self._tool_cache["list_cached_outputs"] = {
+        cache["list_cached_outputs"] = {
             "name": "list_cached_outputs",
             "description": "List all cached truncated outputs with cache_id, age, size, and tool name. Use this to find cache IDs for get_cached_output.",
             "inputSchema": {
@@ -574,7 +756,7 @@ class IdaMultiMcpServer:
             }
         }
 
-        self._tool_cache["get_cached_output"] = {
+        cache["get_cached_output"] = {
             "name": "get_cached_output",
             "description": "Retrieve cached output from a previous tool call that was truncated. Use this to get additional chunks of large responses.",
             "inputSchema": {
@@ -597,7 +779,7 @@ class IdaMultiMcpServer:
             }
         }
 
-        self._tool_cache["decompile_to_file"] = {
+        cache["decompile_to_file"] = {
             "name": "decompile_to_file",
             "description": "Decompile functions and save results directly to files on disk. "
                 "IMPORTANT: Each function requires a separate IDA decompile call. "
@@ -617,11 +799,15 @@ class IdaMultiMcpServer:
                     },
                     "output_dir": {
                         "type": "string",
-                        "description": "Directory to save decompiled files"
+                        "description": "Directory to save decompiled files. Must be within the current working directory unless allow_outside_cwd is true."
                     },
                     "mode": {
                         "type": "string",
                         "description": "Output mode: 'single' = one .c file per function (default), 'merged' = all in one file"
+                    },
+                    "allow_outside_cwd": {
+                        "type": "boolean",
+                        "description": "Permit output_dir outside the current working directory (default: false)."
                     },
                     "instance_id": {
                         "type": "string",
@@ -632,11 +818,15 @@ class IdaMultiMcpServer:
             }
         }
 
+        # Register similarity tool schemas (always available; extraction is IDA-side)
+        for schema in similarity.SIMILARITY_TOOL_SCHEMAS:
+            cache[schema["name"]] = schema.copy()
+
         # Register idalib management tool schemas (only if IDA Pro with idalib is available)
         from .idalib_manager import is_idalib_available
         if is_idalib_available():
             for schema in idalib_tools.IDALIB_TOOL_SCHEMAS:
-                self._tool_cache[schema["name"]] = schema.copy()
+                cache[schema["name"]] = schema.copy()
 
         _SINGLE_THREAD_WARNING = (
             " WARNING: IDA executes on a single main thread. "
@@ -678,7 +868,7 @@ class IdaMultiMcpServer:
                     "Avoid count=0 (all) with glob filters on large binaries."
                 )
 
-            self._tool_cache[schema["name"]] = schema
+            cache[schema["name"]] = schema
 
         # Discover IDA tools from any available instance (rediscover if needed).
         instances = self.registry.list_instances()
@@ -736,11 +926,11 @@ class IdaMultiMcpServer:
                         "Avoid count=0 (all) with glob filters on large binaries."
                     )
 
-                self._tool_cache[tool_schema["name"]] = tool_schema
+                cache[tool_schema["name"]] = tool_schema
 
         # MCP spec expects outputSchema to be an object schema.
         # Some clients validate all advertised tools; keep schemas conservative.
-        for tool_schema in self._tool_cache.values():
+        for tool_schema in cache.values():
             os = tool_schema.get("outputSchema")
             if not os:
                 tool_schema["outputSchema"] = {"type": "object"}
@@ -752,8 +942,12 @@ class IdaMultiMcpServer:
                     "required": ["result"],
                 }
 
+        # Publish in one rebind. Readers (tools/list, _coerce_structured_for_schema)
+        # run on stdio worker threads, so they must never observe a partially
+        # populated cache: they either see the whole old dict or the whole new one.
+        self._tool_cache = cache
         self._cache_valid = True
-        return len(self._tool_cache)
+        return len(cache)
 
     def _discover_ida_tools(self, instance_info: dict) -> list[dict]:
         """Discover tools from an IDA instance.
@@ -775,6 +969,7 @@ class IdaMultiMcpServer:
         if host not in ALLOWED_HOSTS:
             return []
 
+        conn = None
         try:
             conn = http.client.HTTPConnection(host, port, timeout=10.0)
             request_body = json.dumps({
@@ -785,7 +980,6 @@ class IdaMultiMcpServer:
             conn.request("POST", "/mcp", request_body, {"Content-Type": "application/json"})
             response = conn.getresponse()
             response_data = json.loads(response.read().decode())
-            conn.close()
 
             if "result" in response_data:
                 tools = response_data["result"].get("tools", [])
@@ -796,6 +990,9 @@ class IdaMultiMcpServer:
         except Exception as e:
             print(f"[ida-multi-mcp] Failed to discover tools from instance: {e}", file=sys.stderr)
             return []
+        finally:
+            if conn is not None:
+                conn.close()  # always release the socket, even on error
 
     def run(self):
         """Run the MCP server with stdio transport."""

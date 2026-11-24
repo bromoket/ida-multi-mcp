@@ -28,6 +28,8 @@ import idaapi
 import idautils
 import idc
 
+from . import compat
+
 from .sync import IDAError
 
 # ============================================================================
@@ -431,8 +433,8 @@ def get_image_size() -> int:
     except AttributeError:
         import ida_ida
 
-        omin_ea = ida_ida.inf_get_omin_ea()
-        omax_ea = ida_ida.inf_get_omax_ea()
+        omin_ea = compat.inf_get_omin_ea()
+        omax_ea = compat.inf_get_omax_ea()
     image_size = omax_ea - omin_ea
     header = idautils.peutils_t().header()
     if header and header[:4] == b"PE\0\0":
@@ -468,6 +470,14 @@ def parse_address(addr: str | int) -> int:
 
 def read_bytes_bss_safe(ea: int, size: int) -> bytes:
     """Read bytes from the IDB, substituting zeros for unloaded BSS bytes."""
+    if size <= 0:
+        return b""
+    # Fast path: one bulk read when the whole range is loaded. get_bytes
+    # returns None if any byte is missing, so we only fall back to the slow
+    # per-byte loop for regions that actually straddle a BSS gap.
+    data = ida_bytes.get_bytes(ea, size)
+    if data is not None and len(data) == size:
+        return bytes(data)
     out = bytearray(size)
     for offset in range(size):
         current_ea = ea + offset
@@ -618,7 +628,9 @@ def get_function(addr, *, raise_error=True):
     except AttributeError:
         name = ida_funcs.get_func_name(fn.start_ea)
 
-    return Function(addr=hex(addr), name=name, size=hex(fn.end_ea - fn.start_ea))
+    # Always report the canonical entry point: callers pass arbitrary
+    # addresses inside the function (e.g. xref sources).
+    return Function(addr=hex(fn.start_ea), name=name, size=hex(fn.end_ea - fn.start_ea))
 
 
 def get_prototype(fn: ida_funcs.func_t) -> Optional[str]:
@@ -1236,7 +1248,7 @@ def handle_large_output(result: Any, line_threshold: int = 3000) -> Any:
                 suffix=".json", prefix="ida_mcp_", text=True
             )
             try:
-                with os.fdopen(fd, "w") as f:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
                     f.write(serialized)
 
                 return {

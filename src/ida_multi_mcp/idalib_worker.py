@@ -15,6 +15,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import atexit
 import logging
 import signal
 import sys
@@ -89,19 +90,45 @@ def main() -> None:
         if MCP_UNSAFE:
             logger.info("Unsafe tools disabled (start with --unsafe to enable)")
 
-    # --- Signal handling for clean shutdown -----------------------------------
-    def _shutdown(signum, frame):
-        logger.info("Received signal %s — shutting down...", signum)
+    # --- Clean shutdown -------------------------------------------------------
+    # close_database persists the IDB and releases the idalib lock. Register it
+    # via atexit so it also runs on normal interpreter exit. On Windows,
+    # proc.terminate() maps to TerminateProcess, which kills the process without
+    # delivering SIGTERM — so the signal handler alone is not enough there.
+    _closed = False
+
+    def _close_db_once():
+        nonlocal _closed
+        if _closed:
+            return
+        _closed = True
         try:
             idapro.close_database()
         except Exception:
             pass
+
+    atexit.register(_close_db_once)
+
+    def _shutdown(signum, frame):
+        logger.info("Received signal %s — shutting down...", signum)
+        _close_db_once()
         sys.exit(0)
 
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
+    # Windows: the manager sends CTRL_BREAK_EVENT for graceful shutdown,
+    # which arrives as SIGBREAK. TerminateProcess (proc.terminate) cannot be
+    # caught, so CTRL_BREAK is the only way to close the IDB cleanly there.
+    if hasattr(signal, "SIGBREAK"):
+        signal.signal(signal.SIGBREAK, _shutdown)
 
     # --- Serve ---------------------------------------------------------------
+    # Truncated tool output hands back a download URL, and only this process can
+    # serve it — the cache lives here, in rpc's module state. Without this the URL
+    # keeps rpc's default (port 13337), which nothing listens on.
+    from ida_multi_mcp.ida_mcp.rpc import set_download_base_url
+    set_download_base_url(f"http://{args.host}:{args.port}")
+
     logger.info("Serving on %s:%d", args.host, args.port)
     MCP_SERVER.serve(host=args.host, port=args.port, background=False)
 

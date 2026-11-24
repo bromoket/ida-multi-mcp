@@ -27,7 +27,12 @@ class TestFindFreePort:
 @pytest.fixture(autouse=True)
 def _mock_idalib_available():
     """Assume IDA Pro (idalib) is available in all manager tests."""
-    with patch("ida_multi_mcp.idalib_manager.is_idalib_available", return_value=True):
+    with patch("ida_multi_mcp.idalib_manager.is_idalib_available", return_value=True), patch(
+        "ida_multi_mcp.idalib_manager.query_binary_identity",
+        return_value={"module": "test.exe", "input_fingerprint": {
+            "algorithm": "sha256", "digest": "ab" * 32,
+        }},
+    ):
         yield
 
 
@@ -64,6 +69,7 @@ class TestIdalibManagerSpawn:
         mock_proc = MagicMock()
         mock_proc.pid = 99999
         mock_proc.poll.return_value = None  # still running
+        mock_proc.stderr.read.return_value = b""  # drain thread sentinel
         mock_popen.return_value = mock_proc
         mock_ping.return_value = True
 
@@ -79,6 +85,27 @@ class TestIdalibManagerSpawn:
         info = tmp_registry.get_instance(result["instance_id"])
         assert info is not None
         assert info["type"] == "idalib"
+        assert info["input_fingerprint"] == {"algorithm": "sha256", "digest": "ab" * 32}
+
+    @patch("ida_multi_mcp.idalib_manager.subprocess.Popen")
+    @patch("ida_multi_mcp.idalib_manager.ping_instance")
+    def test_spawn_uses_devnull_stdin(self, mock_ping, mock_popen, tmp_path, tmp_registry):
+        """The worker must inherit stdin=DEVNULL, otherwise idalib.dll blocks
+        reading the MCP protocol pipe when the server is a stdio child."""
+        binary = tmp_path / "test.bin"
+        binary.write_bytes(b"\x00" * 16)
+
+        mock_proc = MagicMock()
+        mock_proc.pid = 99999
+        mock_proc.poll.return_value = None
+        mock_proc.stderr.read.return_value = b""  # drain thread sentinel
+        mock_popen.return_value = mock_proc
+        mock_ping.return_value = True
+
+        mgr = IdalibManager(tmp_registry)
+        mgr.spawn_session(str(binary))
+
+        assert mock_popen.call_args.kwargs["stdin"] == subprocess.DEVNULL
 
     @patch("ida_multi_mcp.idalib_manager.query_binary_metadata",
            return_value={"module": "test.exe", "path": "/tmp/test.exe.i64"})
@@ -95,6 +122,7 @@ class TestIdalibManagerSpawn:
         mock_proc = MagicMock()
         mock_proc.pid = 77777
         mock_proc.poll.return_value = None
+        mock_proc.stderr.read.return_value = b""  # drain thread sentinel
         mock_popen.return_value = mock_proc
 
         mgr = IdalibManager(tmp_registry)
@@ -113,7 +141,10 @@ class TestIdalibManagerSpawn:
         mock_proc = MagicMock()
         mock_proc.pid = 99999
         mock_proc.poll.return_value = None
-        mock_proc.communicate.return_value = (b"", b"analysis failed")
+        # Simulate the worker writing to stderr before the drain thread reads
+        # it: first read returns the data, second read returns b"" (EOF) which
+        # stops the iter() in _drain_stderr.
+        mock_proc.stderr.read.side_effect = [b"analysis failed", b""]
         mock_popen.return_value = mock_proc
 
         mgr = IdalibManager(tmp_registry)
@@ -121,6 +152,10 @@ class TestIdalibManagerSpawn:
 
         assert "error" in result
         assert "ready" in result["error"].lower()
+        # The drain thread must have captured the worker's stderr and surfaced
+        # it in the diagnostic — this verifies the terminate→wait→join→read
+        # ordering produces the worker's dying output, not an empty string.
+        assert "analysis failed" in result["error"]
 
 
 class TestIdalibManagerClose:
@@ -133,6 +168,7 @@ class TestIdalibManagerClose:
         mock_proc = MagicMock()
         mock_proc.pid = 99999
         mock_proc.poll.return_value = None
+        mock_proc.stderr.read.return_value = b""  # drain thread sentinel
         mock_popen.return_value = mock_proc
 
         mgr = IdalibManager(tmp_registry)
@@ -151,6 +187,44 @@ class TestIdalibManagerClose:
         assert "error" in result
 
 
+class TestGracefulTermination:
+    def test_skips_already_exited(self):
+        proc = MagicMock()
+        proc.poll.return_value = 0  # already exited
+        IdalibManager._terminate_gracefully(proc)
+        proc.wait.assert_not_called()
+        proc.kill.assert_not_called()
+
+    def test_graceful_signal_then_wait(self):
+        proc = MagicMock()
+        proc.poll.return_value = None
+        IdalibManager._terminate_gracefully(proc)
+        # Graceful path: no force-kill needed.
+        proc.wait.assert_called_once()
+        proc.kill.assert_not_called()
+
+    def test_falls_back_to_kill_on_timeout(self):
+        proc = MagicMock()
+        proc.poll.return_value = None
+        # Both graceful and terminate waits time out → hard kill.
+        proc.wait.side_effect = subprocess.TimeoutExpired(cmd="worker", timeout=10)
+        IdalibManager._terminate_gracefully(proc)
+        proc.terminate.assert_called_once()
+        proc.kill.assert_called_once()
+
+    @patch("ida_multi_mcp.idalib_manager.sys.platform", "win32")
+    def test_windows_uses_ctrl_break(self):
+        import signal
+        # CTRL_BREAK_EVENT only exists on Windows; create it so the win32 code
+        # path is exercisable on Linux/macOS CI runners too.
+        sentinel = getattr(signal, "CTRL_BREAK_EVENT", 1)
+        with patch.object(signal, "CTRL_BREAK_EVENT", sentinel, create=True):
+            proc = MagicMock()
+            proc.poll.return_value = None
+            IdalibManager._terminate_gracefully(proc)
+            proc.send_signal.assert_called_once_with(sentinel)
+
+
 class TestIdalibManagerList:
     @patch("ida_multi_mcp.idalib_manager.subprocess.Popen")
     @patch("ida_multi_mcp.idalib_manager.ping_instance", return_value=True)
@@ -162,6 +236,7 @@ class TestIdalibManagerList:
         mock_proc = MagicMock()
         mock_proc.pid = 99999
         mock_proc.poll.return_value = None
+        mock_proc.stderr.read.return_value = b""  # drain thread sentinel
         mock_popen.return_value = mock_proc
 
         mgr = IdalibManager(tmp_registry)
@@ -184,6 +259,7 @@ class TestIdalibManagerStatus:
         mock_proc = MagicMock()
         mock_proc.pid = 99999
         mock_proc.poll.return_value = None
+        mock_proc.stderr.read.return_value = b""  # drain thread sentinel
         mock_popen.return_value = mock_proc
 
         mgr = IdalibManager(tmp_registry)

@@ -29,11 +29,20 @@ def is_process_alive(pid: int) -> bool:
             import ctypes
             kernel32 = ctypes.windll.kernel32
             PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259  # GetExitCodeProcess return for a running process
             handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-            if handle:
-                kernel32.CloseHandle(handle)
+            if not handle:
+                return False
+            try:
+                # OpenProcess succeeds for a just-exited process whose handle is
+                # not yet released (a zombie). Confirm liveness via exit code.
+                exit_code = ctypes.c_ulong(0)
+                if kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                    return exit_code.value == STILL_ACTIVE
+                # Could not read exit code — assume alive (benefit of the doubt).
                 return True
-            return False
+            finally:
+                kernel32.CloseHandle(handle)
         except Exception:
             return False
     else:
@@ -63,6 +72,7 @@ def ping_instance(host: str, port: int, timeout: float = 15.0) -> bool:
     # Security: only allow localhost connections (prevent SSRF)
     if host not in _ALLOWED_HOSTS:
         return False
+    conn = None
     try:
         conn = http.client.HTTPConnection(host, port, timeout=timeout)
         request = json.dumps({
@@ -72,10 +82,12 @@ def ping_instance(host: str, port: int, timeout: float = 15.0) -> bool:
         })
         conn.request("POST", "/mcp", request, {"Content-Type": "application/json"})
         response = conn.getresponse()
-        conn.close()
         return response.status == 200
     except Exception:
         return False
+    finally:
+        if conn is not None:
+            conn.close()  # always release the socket, even on error
 
 
 def check_instance_health(instance: dict) -> bool:
@@ -134,6 +146,35 @@ def cleanup_stale_instances(registry: "InstanceRegistry", timeout_seconds: int =
     return removed
 
 
+def query_binary_identity(host: str, port: int, timeout: float = 5.0) -> dict | None:
+    """Read the loaded input's stored identity without hashing the disk file."""
+    if host not in _ALLOWED_HOSTS:
+        return None
+    conn = None
+    try:
+        conn = http.client.HTTPConnection(host, port, timeout=timeout)
+        request = json.dumps({
+            "jsonrpc": "2.0", "method": "resources/read",
+            "params": {"uri": "ida://idb/identity"}, "id": 1,
+        })
+        conn.request("POST", "/mcp", request, {"Content-Type": "application/json"})
+        response = conn.getresponse()
+        if response.status != 200:
+            return None
+        data = json.loads(response.read().decode("utf-8"))
+        contents = data.get("result", {}).get("contents", [])
+        if contents:
+            identity = json.loads(contents[0].get("text", "{}"))
+            if isinstance(identity, dict):
+                return identity
+    except Exception:
+        pass
+    finally:
+        if conn is not None:
+            conn.close()
+    return None
+
+
 def query_binary_metadata(host: str, port: int, timeout: float = 5.0) -> dict | None:
     """Query an IDA instance for its current binary metadata.
 
@@ -153,6 +194,7 @@ def query_binary_metadata(host: str, port: int, timeout: float = 5.0) -> dict | 
     # Security: only allow localhost connections (prevent SSRF)
     if host not in _ALLOWED_HOSTS:
         return None
+    conn = None
     try:
         conn = http.client.HTTPConnection(host, port, timeout=timeout)
         request = json.dumps({
@@ -164,7 +206,6 @@ def query_binary_metadata(host: str, port: int, timeout: float = 5.0) -> dict | 
         conn.request("POST", "/mcp", request, {"Content-Type": "application/json"})
         response = conn.getresponse()
         data = json.loads(response.read().decode())
-        conn.close()
 
         # Extract metadata from resource response
         result = data.get("result", {})
@@ -174,7 +215,44 @@ def query_binary_metadata(host: str, port: int, timeout: float = 5.0) -> dict | 
             return json.loads(text)
     except Exception:
         pass
+    finally:
+        if conn is not None:
+            conn.close()  # always release the socket, even on error
     return None
+
+
+_IDA_PROCESS_NAMES = {
+    "ida.exe", "ida64.exe", "idat.exe", "idat64.exe",
+    "ida", "ida64", "idat", "idat64",
+}
+_LISTEN_STATES = {"LISTENING", "侦听"}
+
+
+def _console_output(cmd: list[str], timeout: int = 10) -> str:
+    """Run a console utility and return decoded stdout.
+
+    Windows ``tasklist`` / ``netstat`` emit OEM/GBK. Python UTF-8 mode
+    (``PYTHONUTF8=1``, common in MCP clients) makes ``text=True`` decode
+    as UTF-8. The reader thread then raises ``UnicodeDecodeError``,
+    ``check_output`` returns ``None``, and callers crash on ``.strip()``
+    before MCP ``initialize`` — the client sees
+    ``handshake failed: connection closed: initialize response``.
+    """
+    kwargs: dict = {
+        "timeout": timeout,
+        "stderr": subprocess.DEVNULL,
+        "errors": "replace",
+    }
+    if sys.platform == "win32":
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        kwargs["encoding"] = "oem"
+    else:
+        kwargs["encoding"] = "utf-8"
+    try:
+        out = subprocess.check_output(cmd, **kwargs)
+    except (subprocess.SubprocessError, OSError, UnicodeError):
+        return ""
+    return out or ""
 
 
 def _find_ida_listening_ports() -> list[tuple[int, int]]:
@@ -183,100 +261,77 @@ def _find_ida_listening_ports() -> list[tuple[int, int]]:
     Returns:
         List of (pid, port) tuples for IDA processes with listening TCP ports
     """
-    ida_names = {"ida.exe", "ida64.exe", "idat.exe", "idat64.exe",
-                 "ida", "ida64", "idat", "idat64"}
-    results = []
+    results: list[tuple[int, int]] = []
 
     if sys.platform == "win32":
-        try:
-            # Get IDA PIDs
-            out = subprocess.check_output(
-                ["tasklist", "/FO", "CSV", "/NH"],
-                text=True, timeout=10, creationflags=subprocess.CREATE_NO_WINDOW,
-            )
-            ida_pids = set()
-            for line in out.strip().splitlines():
-                parts = line.strip('"').split('","')
-                if len(parts) >= 2 and parts[0].lower() in ida_names:
-                    try:
-                        ida_pids.add(int(parts[1]))
-                    except ValueError:
-                        pass
+        out = _console_output(["tasklist", "/FO", "CSV", "/NH"])
+        ida_pids: set[int] = set()
+        for line in out.strip().splitlines():
+            parts = line.strip('"').split('","')
+            if len(parts) >= 2 and parts[0].lower() in _IDA_PROCESS_NAMES:
+                try:
+                    ida_pids.add(int(parts[1]))
+                except ValueError:
+                    continue
+        if not ida_pids:
+            return []
 
-            if not ida_pids:
-                return []
+        netstat = _console_output(["netstat", "-ano", "-p", "TCP"])
+        for line in netstat.splitlines():
+            parts = line.split()
+            if len(parts) < 5:
+                continue
+            if parts[3].upper() not in _LISTEN_STATES:
+                continue
+            try:
+                pid = int(parts[4])
+            except ValueError:
+                continue
+            if pid not in ida_pids:
+                continue
+            # Local address, e.g. 127.0.0.1:57079 or [::1]:57079
+            port_str = parts[1].rsplit(":", 1)[-1]
+            try:
+                results.append((pid, int(port_str)))
+            except ValueError:
+                continue
+        return results
 
-            # Get listening ports for those PIDs
-            out = subprocess.check_output(
-                ["netstat", "-ano", "-p", "TCP"],
-                text=True, timeout=10, creationflags=subprocess.CREATE_NO_WINDOW,
-            )
-            for line in out.splitlines():
-                parts = line.split()
-                if len(parts) >= 5 and parts[3] == "LISTENING":
+    out = _console_output(["lsof", "-iTCP", "-sTCP:LISTEN", "-nP", "-F", "pcn"])
+    if out:
+        current_pid = None
+        current_name = None
+        for line in out.splitlines():
+            if line.startswith("p"):
+                current_pid = int(line[1:])
+            elif line.startswith("c"):
+                current_name = line[1:]
+            elif line.startswith("n") and current_pid and current_name:
+                if current_name.lower() in _IDA_PROCESS_NAMES:
+                    port_str = line.rsplit(":", 1)[-1]
                     try:
-                        pid = int(parts[4])
+                        results.append((current_pid, int(port_str)))
                     except ValueError:
                         continue
-                    if pid in ida_pids:
-                        # Parse local address (e.g. 127.0.0.1:57079)
-                        addr = parts[1]
-                        port_str = addr.rsplit(":", 1)[-1]
-                        try:
-                            results.append((pid, int(port_str)))
-                        except ValueError:
-                            pass
-        except (subprocess.SubprocessError, OSError):
-            pass
-    else:
-        # Unix: use lsof
-        try:
-            out = subprocess.check_output(
-                ["lsof", "-iTCP", "-sTCP:LISTEN", "-nP", "-F", "pcn"],
-                text=True, timeout=10,
-            )
-            current_pid = None
-            current_name = None
-            for line in out.splitlines():
-                if line.startswith("p"):
-                    current_pid = int(line[1:])
-                elif line.startswith("c"):
-                    current_name = line[1:]
-                elif line.startswith("n") and current_pid and current_name:
-                    if current_name.lower() in ida_names:
-                        port_str = line.rsplit(":", 1)[-1]
-                        try:
-                            results.append((current_pid, int(port_str)))
-                        except ValueError:
-                            pass
-        except (subprocess.SubprocessError, OSError, FileNotFoundError):
-            # lsof not available, try ss
-            try:
-                out = subprocess.check_output(
-                    ["ss", "-tlnp"],
-                    text=True, timeout=10,
-                )
-                for line in out.splitlines():
-                    for name in ida_names:
-                        if name in line:
-                            # Extract port and pid
-                            parts = line.split()
-                            for part in parts:
-                                if ":" in part:
-                                    port_str = part.rsplit(":", 1)[-1]
-                                    try:
-                                        port = int(port_str)
-                                        # Extract pid from pid=NNNN
-                                        import re
-                                        m = re.search(r"pid=(\d+)", line)
-                                        if m:
-                                            results.append((int(m.group(1)), port))
-                                        break
-                                    except ValueError:
-                                        continue
-            except (subprocess.SubprocessError, OSError, FileNotFoundError):
-                pass
+        return results
 
+    out = _console_output(["ss", "-tlnp"])
+    import re
+    for line in out.splitlines():
+        if not any(name in line for name in _IDA_PROCESS_NAMES):
+            continue
+        match = re.search(r"pid=(\d+)", line)
+        if not match:
+            continue
+        for part in line.split():
+            if ":" not in part:
+                continue
+            port_str = part.rsplit(":", 1)[-1]
+            try:
+                results.append((int(match.group(1)), int(port_str)))
+            except ValueError:
+                continue
+            break
     return results
 
 
@@ -288,6 +343,7 @@ def rediscover_instances(registry: "InstanceRegistry") -> list[str]:
     registers any that aren't already in the registry.
 
     Called on proxy startup when the registry has no registered instances.
+    Discovery failures must not prevent MCP initialize / stdio serve.
 
     Args:
         registry: The instance registry
@@ -295,6 +351,14 @@ def rediscover_instances(registry: "InstanceRegistry") -> list[str]:
     Returns:
         List of newly registered instance IDs
     """
+    try:
+        return _rediscover_instances(registry)
+    except Exception as exc:
+        print(f"[ida-multi-mcp] instance rediscovery skipped: {exc}", file=sys.stderr)
+        return []
+
+
+def _rediscover_instances(registry: "InstanceRegistry") -> list[str]:
     registered = []
     existing = registry.list_instances()
 
@@ -323,6 +387,7 @@ def rediscover_instances(registry: "InstanceRegistry") -> list[str]:
 
         idb_path = metadata.get("path", "")
         binary_name = metadata.get("module", "unknown")
+        identity = query_binary_identity(host, port)
 
         instance_id = registry.register(
             pid=pid,
@@ -330,6 +395,7 @@ def rediscover_instances(registry: "InstanceRegistry") -> list[str]:
             idb_path=idb_path,
             binary_name=binary_name,
             binary_path=metadata.get("input_file", ""),
+            input_fingerprint=(identity or {}).get("input_fingerprint"),
             arch=metadata.get("arch", "unknown"),
             host=host,
         )

@@ -1,0 +1,18 @@
+{
+  "va2name": {
+    "0x1400017a0": "adler32",
+    "0x140001680": "crc32_bitwise",
+    "0x1400016d0": "crc32_lut",
+    "0x140001860": "fib",
+    "0x140001820": "fnv1a",
+    "0x140002df0": "main",
+    "0x140001510": "max_array",
+    "0x140001630": "parse_csv",
+    "0x140001560": "parse_kv",
+    "0x1400015d0": "parse_kv_r",
+    "0x140001450": "sum_array",
+    "0x1400014b0": "sum_array_ptr",
+    "0x140001480": "sum_array_while",
+    "0x1400014d0": "xor_array"
+  }
+}

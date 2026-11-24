@@ -3,11 +3,11 @@ import queue
 import functools
 import os
 import sys
+import threading
 import time
 from enum import IntEnum
 import idaapi
 import ida_kernwin
-import idc
 from .rpc import McpToolError
 from .zeromcp.jsonrpc import get_current_cancel_event, RequestCancelledError
 
@@ -40,6 +40,26 @@ logger = logging.getLogger(__name__)
 _TOOL_TIMEOUT_ENV = "IDA_MCP_TOOL_TIMEOUT_SEC"
 _DEFAULT_TOOL_TIMEOUT_SEC = 15.0
 
+# After the deadline fires ida_kernwin.set_cancelled(), how long a tool may keep
+# running so it can notice the flag and format a partial response before
+# IDASyncError is raised.
+#
+# This does extend the worst case to timeout + grace. It only buys anything for
+# work that actually polls user_cancelled() (the C SDK calls); a pure-Python
+# loop just runs longer. Set to 0 to enforce the timeout strictly.
+_NATIVE_CANCEL_GRACE_ENV = "IDA_MCP_CANCEL_GRACE_SEC"
+_DEFAULT_NATIVE_CANCEL_GRACE_SEC = 5.0
+
+
+def _get_native_cancel_grace_seconds() -> float:
+    value = os.getenv(_NATIVE_CANCEL_GRACE_ENV, "").strip()
+    if value == "":
+        return _DEFAULT_NATIVE_CANCEL_GRACE_SEC
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        return _DEFAULT_NATIVE_CANCEL_GRACE_SEC
+
 
 def _get_tool_timeout_seconds() -> float:
     value = os.getenv(_TOOL_TIMEOUT_ENV, "").strip()
@@ -62,9 +82,21 @@ def _sync_wrapper(ff):
 
     def runned():
         if not call_stack.empty():
-            last_func_name = call_stack.get()
-            error_str = f"Call stack is not empty while calling the function {ff.__name__} from {last_func_name}"
-            raise IDASyncError(error_str)
+            # Non-blocking: a reentrant @idasync call from within another
+            # tool's ff() on this same main thread may have drained the queue
+            # between empty() and get().
+            try:
+                last_func_name = call_stack.get_nowait()
+            except queue.Empty:
+                last_func_name = "<empty>"
+            # Report through res_container instead of raising: execute_sync
+            # swallows the exception, and the res_container.get() below would
+            # then block the requesting thread forever on an empty queue.
+            res_container.put(IDASyncError(
+                f"Call stack is not empty while calling the function "
+                f"{ff.__name__} from {last_func_name}"
+            ))
+            return
 
         call_stack.put((ff.__name__))
         try:
@@ -72,7 +104,13 @@ def _sync_wrapper(ff):
         except Exception as x:
             res_container.put(x)
         finally:
-            call_stack.get()
+            # Non-blocking: a reentrant @idasync invoked synchronously inside
+            # ff() may have already popped our entry. A blocking get() here
+            # would freeze the IDA main thread and hang every later call.
+            try:
+                call_stack.get_nowait()
+            except queue.Empty:
+                pass
 
     idaapi.execute_sync(runned, idaapi.MFF_WRITE)
     res = res_container.get()
@@ -90,40 +128,79 @@ def _normalize_timeout(value: object) -> float | None:
 
 
 def sync_wrapper(ff, timeout_override: float | None = None):
-    """Wrapper to enable batch mode during IDA synchronization."""
+    """Wrapper to enable timeout and cancellation during IDA synchronization.
+
+    Do not enable IDA's process-global batch mode here. Batch mode suppresses
+    dialogs and selects their default actions, so using it for MCP calls can
+    auto-accept unrelated dialogs in the interactive GUI.
+    """
     # Capture cancel event from thread-local before execute_sync
     cancel_event = get_current_cancel_event()
 
-    old_batch = idc.batch(1)
-    try:
-        timeout = timeout_override
-        if timeout is None:
-            timeout = _get_tool_timeout_seconds()
-        if timeout > 0 or cancel_event is not None:
-            def timed_ff():
-                # Calculate deadline when execution starts on IDA main thread,
-                # not when the request was queued (avoids stale deadlines)
-                deadline = time.monotonic() + timeout if timeout > 0 else None
+    timeout = timeout_override
+    if timeout is None:
+        timeout = _get_tool_timeout_seconds()
+    if timeout > 0 or cancel_event is not None:
+        def timed_ff():
+            # Calculate deadline when execution starts on IDA main thread,
+            # not when the request was queued (avoids stale deadlines)
+            deadline = time.monotonic() + timeout if timeout > 0 else None
 
-                def profilefunc(frame, event, arg):
-                    # Check cancellation first (higher priority)
-                    if cancel_event is not None and cancel_event.is_set():
-                        raise CancelledError("Request was cancelled")
-                    if deadline is not None and time.monotonic() >= deadline:
-                        raise IDASyncError(f"Tool timed out after {timeout:.2f}s")
+            # Native cancellation: clear any stale flag and schedule a
+            # set_cancelled() at the deadline. The sys.setprofile hook below
+            # only fires between Python bytecodes, so it cannot preempt a
+            # pure-C SDK call — a slow scan holds the IDA main thread well
+            # past the timeout and every later tool call queues behind it.
+            #
+            # Many SDK calls already poll user_cancelled() and bail within one
+            # poll cycle: ida_search.find_* (unless SEARCH_NOBRK),
+            # ida_bytes.find_bytes/bin_search (unless BIN_SEARCH_NOBREAK),
+            # ida_hexrays.decompile*, ida_strlist.build_strlist,
+            # ida_auto.auto_wait. set_cancelled() is THREAD_SAFE, so firing it
+            # from a Timer thread is safe.
+            ida_kernwin.clr_cancelled()
+            grace = _get_native_cancel_grace_seconds()
+            cancel_fired_at: list[float | None] = [None]
+            native_timer: threading.Timer | None = None
+            if deadline is not None:
+                def _fire_native_cancel():
+                    cancel_fired_at[0] = time.monotonic()
+                    ida_kernwin.set_cancelled()
 
-                old_profile = sys.getprofile()
-                sys.setprofile(profilefunc)
-                try:
-                    return ff()
-                finally:
-                    sys.setprofile(old_profile)
+                native_timer = threading.Timer(timeout, _fire_native_cancel)
+                native_timer.daemon = True
+                native_timer.start()
 
-            timed_ff.__name__ = ff.__name__
-            return _sync_wrapper(timed_ff)
-        return _sync_wrapper(ff)
-    finally:
-        idc.batch(old_batch)
+            def profilefunc(frame, event, arg):
+                # Check request-level cancellation first (higher priority)
+                if cancel_event is not None and cancel_event.is_set():
+                    raise CancelledError("Request was cancelled")
+                # If native cancel just fired, give the tool a short grace
+                # period to format a partial response rather than racing the
+                # IDASyncError. Beyond that we still raise to bound the
+                # response time.
+                fired_at = cancel_fired_at[0]
+                if fired_at is not None and time.monotonic() < fired_at + grace:
+                    return
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise IDASyncError(f"Tool timed out after {timeout:.2f}s")
+
+            old_profile = sys.getprofile()
+            sys.setprofile(profilefunc)
+            try:
+                return ff()
+            finally:
+                sys.setprofile(old_profile)
+                if native_timer is not None:
+                    native_timer.cancel()
+                # Sticky flag: clear unconditionally so the next tool starts
+                # with a clean state. Without this, every subsequent
+                # user_cancelled() returns True forever.
+                ida_kernwin.clr_cancelled()
+
+        timed_ff.__name__ = ff.__name__
+        return _sync_wrapper(timed_ff)
+    return _sync_wrapper(ff)
 
 
 def idasync(f):

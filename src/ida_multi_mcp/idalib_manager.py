@@ -12,10 +12,12 @@ import os
 import socket
 import subprocess
 import sys
+import threading
 import time
+from collections import deque
 from typing import TYPE_CHECKING
 
-from .health import is_process_alive, ping_instance, query_binary_metadata
+from .health import is_process_alive, ping_instance, query_binary_metadata, query_binary_identity
 
 if TYPE_CHECKING:
     from .registry import InstanceRegistry
@@ -58,7 +60,7 @@ def _resolve_ida_dir() -> str | None:
         cfg_path = os.path.join(os.path.expanduser("~"), ".idapro", "ida-config.json")
     try:
         import json
-        with open(cfg_path, "r") as f:
+        with open(cfg_path, "r", encoding="utf-8") as f:
             cfg = json.load(f)
         d = cfg.get("Paths", {}).get("ida-install-dir", "").strip()
         if d and os.path.isdir(d):
@@ -143,12 +145,24 @@ class IdalibManager:
 
         creation_flags = 0
         if sys.platform == "win32":
-            creation_flags = subprocess.CREATE_NO_WINDOW
+            # NEW_PROCESS_GROUP lets us send CTRL_BREAK_EVENT for graceful
+            # shutdown (TerminateProcess cannot be caught to close the IDB).
+            creation_flags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
 
         try:
+            # stdin MUST be DEVNULL: when the MCP server runs as a stdio child
+            # of an MCP client (Claude, Trae, Cursor, etc.), its stdin is the
+            # MCP protocol pipe. Without stdin=DEVNULL the worker inherits
+            # this pipe, and idalib.dll's initialization blocks reading from
+            # it — the worker never reaches serve(), causing the persistent
+            # "did not become ready" timeout.
+            # stdout=DEVNULL discards IDA's analysis output.
+            # stderr=PIPE is drained by a background thread (see below) to
+            # prevent pipe buffer deadlock.
             proc = subprocess.Popen(
                 cmd,
-                stdout=subprocess.PIPE,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 creationflags=creation_flags,
             )
@@ -162,16 +176,33 @@ class IdalibManager:
         except Exception as exc:
             return {"error": f"Failed to spawn idalib worker: {exc}"}
 
+        # Drain stderr in background to prevent pipe buffer deadlock.
+        # Without this, IDA's analysis logs fill the OS pipe and the worker
+        # blocks forever on stderr.write(), never starting its HTTP server.
+        # Bounded deque so a chatty worker cannot grow memory without limit.
+        stderr_chunks: deque[bytes] = deque(maxlen=64)
+
+        def _drain_stderr():
+            try:
+                for chunk in iter(lambda: proc.stderr.read(4096), b""):
+                    stderr_chunks.append(chunk)
+            except Exception:
+                pass
+
+        stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
+        stderr_thread.start()
+
         # Wait for the worker to become ready.
         if not self._wait_for_ready(host, port, proc, timeout):
-            # Worker didn't come up — collect stderr for diagnostics.
-            stderr_text = ""
+            # Worker didn't come up — terminate first so its dying stderr is
+            # captured by the drain thread, then collect it for diagnostics.
             try:
                 proc.terminate()
-                _, stderr_bytes = proc.communicate(timeout=5)
-                stderr_text = stderr_bytes.decode(errors="replace")[-500:]
+                proc.wait(timeout=5)
             except Exception:
                 proc.kill()
+            stderr_thread.join(timeout=1)
+            stderr_text = b"".join(stderr_chunks).decode(errors="replace")[-500:]
             return {
                 "error": (
                     f"idalib worker did not become ready within {timeout}s. "
@@ -185,6 +216,7 @@ class IdalibManager:
         metadata = query_binary_metadata(host, port, timeout=5.0)
         module_name = (metadata or {}).get("module") if metadata else None
         binary_name = module_name or os.path.basename(resolved_path)
+        identity = query_binary_identity(host, port)
         instance_id = self.registry.register(
             pid=proc.pid,
             port=port,
@@ -192,6 +224,7 @@ class IdalibManager:
             host=host,
             binary_name=binary_name,
             binary_path=resolved_path,
+            input_fingerprint=(identity or {}).get("input_fingerprint"),
             type="idalib",
         )
 
@@ -219,19 +252,58 @@ class IdalibManager:
                 return {"ok": True, "note": "orphaned entry removed"}
             return {"error": f"Instance '{instance_id}' is not a managed idalib session"}
 
-        # Terminate the subprocess.
-        try:
-            proc.terminate()
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=5)
-        except Exception:
-            proc.kill()
+        # Terminate the subprocess, preferring a graceful shutdown so the
+        # worker can close its IDB cleanly.
+        self._terminate_gracefully(proc)
 
         del self._processes[instance_id]
         self.registry.unregister(instance_id)
         return {"ok": True}
+
+    @staticmethod
+    def _terminate_gracefully(proc: subprocess.Popen) -> None:
+        """Ask the worker to shut down cleanly, then force-kill if it lingers.
+
+        On Windows, ``proc.terminate()`` maps to TerminateProcess, which the
+        worker cannot intercept to close its IDB. Send CTRL_BREAK_EVENT first
+        (handled as SIGBREAK by the worker) and fall back to terminate/kill.
+        On POSIX, SIGTERM already triggers the worker's clean-shutdown handler.
+        """
+        if proc.poll() is not None:
+            return
+
+        # Step 1: graceful request (CTRL_BREAK on Windows, SIGTERM on POSIX).
+        try:
+            if sys.platform == "win32":
+                import signal as _signal
+                proc.send_signal(_signal.CTRL_BREAK_EVENT)
+            else:
+                proc.terminate()
+            proc.wait(timeout=10)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        except Exception:
+            pass
+
+        # Step 2 (Windows only): TerminateProcess, since CTRL_BREAK may be
+        # ignored. On POSIX the graceful step already sent SIGTERM, so go
+        # straight to the hard kill below instead of repeating terminate().
+        if sys.platform == "win32":
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+                return
+            except subprocess.TimeoutExpired:
+                pass
+            except Exception:
+                pass
+
+        # Step 3: hard kill.
+        try:
+            proc.kill()
+        except Exception:
+            pass
 
     def close_all_sessions(self) -> int:
         """Terminate all managed idalib workers. Returns count closed."""

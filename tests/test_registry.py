@@ -369,3 +369,57 @@ class TestLoadEntryValidation:
         instances = reg.list_instances()
         assert "bad" not in instances
         assert "good" in instances
+
+
+# ---------------------------------------------------------------------------
+# In-process read cache
+# ---------------------------------------------------------------------------
+class TestReadCache:
+    def test_cached_read_skips_file_parse(self, populated_registry, monkeypatch):
+        # Prime the cache.
+        populated_registry.list_instances()
+
+        # Subsequent reads must not re-open the registry file.
+        def _boom(*args, **kwargs):
+            raise AssertionError("registry file re-opened on cached read")
+
+        monkeypatch.setattr(json, "load", _boom)
+        instances = populated_registry.list_instances()
+        assert len(instances) == 3
+        assert populated_registry.get_active() is not None
+
+    def test_returned_data_is_isolated_from_cache(self, populated_registry):
+        first = populated_registry.list_instances()
+        iid = next(iter(first))
+        first[iid]["binary_name"] = "mutated"
+
+        second = populated_registry.list_instances()
+        assert second[iid]["binary_name"] != "mutated"
+
+    def test_external_write_invalidates_cache(self, populated_registry):
+        populated_registry.list_instances()  # prime cache
+
+        # Simulate another process replacing the file (atomic write).
+        path = populated_registry.registry_path
+        data = {
+            "instances": {"ext1": _valid_entry(binary_name="external.exe")},
+            "active_instance": "ext1",
+            "expired": {},
+        }
+        tmp = path + ".ext"
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, path)
+
+        instances = populated_registry.list_instances()
+        assert list(instances) == ["ext1"]
+        assert instances["ext1"]["binary_name"] == "external.exe"
+
+    def test_write_through_updates_cache(self, tmp_registry):
+        iid = tmp_registry.register(
+            pid=1, port=5000, idb_path="/a.i64",
+            binary_name="a.exe", host="127.0.0.1",
+        )
+        assert tmp_registry.get_instance(iid)["binary_name"] == "a.exe"
+        tmp_registry.unregister(iid)
+        assert tmp_registry.get_instance(iid) is None
