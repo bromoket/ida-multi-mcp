@@ -34,12 +34,37 @@ it), so all IDA/Qt imports are local to the functions that need them.
 from __future__ import annotations
 
 import collections
+import contextlib
 import os
 import queue
 import threading
 import time
 import types
-from typing import Any
+from collections.abc import Mapping
+from typing import Any, TypedDict
+
+
+class UiResult(TypedDict, total=False):
+    """Shape shared by snapshot(), run_command() and the ui_dialogs tool.
+
+    Nested values stay bare dict/list: the MCP schema generator turns Any into
+    "object", which would declare every nested string/int invalid.
+    """
+
+    ok: bool
+    gui: bool
+    note: str
+    error: str
+    modal: dict | None  # pyright: ignore[reportMissingTypeArgument]
+    modal_age_sec: float | None
+    modal_owner: str | None
+    active_tool: str | None
+    recently_dismissed: list  # pyright: ignore[reportMissingTypeArgument]
+    dialog: dict  # pyright: ignore[reportMissingTypeArgument]
+    action: str
+    cleared_cancelled: bool | str
+    previous_batch: int | str
+    state: Mapping[str, object]
 
 _POLICY_ENV = "IDA_MCP_DIALOG_POLICY"
 _WAIT_ENV = "IDA_MCP_MODAL_WAIT_SEC"
@@ -60,7 +85,7 @@ _state: dict[str, Any] = {
     "active_tool": None,  # tool currently running on the main thread
 }
 _dismissed: collections.deque[dict[str, Any]] = collections.deque(maxlen=20)
-_commands: queue.Queue[tuple[str, dict[str, Any], threading.Event]] = queue.Queue()
+_commands: queue.Queue[tuple[str, UiResult, threading.Event]] = queue.Queue()
 _timer: Any = None  # keeps the QTimer alive for the life of the process
 
 
@@ -97,7 +122,7 @@ def is_installed() -> bool:
         return bool(_state["installed"])
 
 
-def snapshot() -> dict[str, Any]:
+def snapshot() -> UiResult:
     """Thread-safe copy of the sampled UI state."""
     with _lock:
         modal = _state["modal"]
@@ -147,7 +172,7 @@ def end_tool() -> None:
 # ---------------------------------------------------------------------------
 
 
-def run_command(action: str, timeout: float = 3.0) -> dict[str, Any]:
+def run_command(action: str, timeout: float = 3.0) -> UiResult:
     """Queue ``action`` for the main thread and wait for its result.
 
     Works while a modal dialog is up, because the sampler tick still fires in
@@ -156,7 +181,7 @@ def run_command(action: str, timeout: float = 3.0) -> dict[str, Any]:
     """
     if not is_installed():
         return {"ok": False, "error": "UI guard not active (headless or no Qt)"}
-    box: dict[str, Any] = {}
+    box: UiResult = {}
     done = threading.Event()
     _commands.put((action, box, done))
     if not done.wait(timeout):
@@ -198,15 +223,14 @@ def _describe_widget(QtWidgets, w) -> dict[str, Any]:
         "object_name": w.objectName(),
         "title": w.windowTitle(),
     }
-    try:
+    # Best effort: a widget torn down mid-sample must not break the tick.
+    with contextlib.suppress(Exception):
         desc["text"] = [
             lbl.text()[:300] for lbl in w.findChildren(QtWidgets.QLabel) if lbl.text()
         ][:6]
         desc["buttons"] = [
             b.text() for b in w.findChildren(QtWidgets.QAbstractButton) if b.text()
         ][:8]
-    except Exception:
-        pass
     return desc
 
 
@@ -242,17 +266,15 @@ def _record_dismissal(desc: dict[str, Any], action: str, reason: str) -> None:
         "reason": reason,
     }
     _dismissed.append(entry)
-    try:
+    with contextlib.suppress(Exception):  # logging must never fail the dismissal
         import ida_kernwin
 
         ida_kernwin.msg(
             f"[ida-multi-mcp] {reason}: {describe(desc)} -> {action}\n"
         )
-    except Exception:
-        pass
 
 
-def _handle_command(QtWidgets, action: str, w) -> dict[str, Any]:
+def _handle_command(QtWidgets, action: str, w) -> UiResult:
     if action in ("dismiss", "accept"):
         if w is None:
             return {"ok": False, "error": "no modal dialog is open"}
@@ -261,7 +283,7 @@ def _handle_command(QtWidgets, action: str, w) -> dict[str, Any]:
         _record_dismissal(desc, result, f"{action} requested via ui_dialogs")
         return {"ok": True, "dialog": desc, "action": result}
     if action == "unstick":
-        out: dict[str, Any] = {"ok": True}
+        out: UiResult = {"ok": True}
         try:
             import ida_kernwin
 
@@ -340,12 +362,10 @@ def _safe_tick() -> None:
         _tick()
     except Exception as exc:
         # A Qt slot must not raise; one bad sample must not stop the guard.
-        try:
+        with contextlib.suppress(Exception):
             import ida_kernwin
 
             ida_kernwin.msg(f"[ida-multi-mcp] ui_guard tick failed: {exc}\n")
-        except Exception:
-            pass
 
 
 def install() -> bool:
